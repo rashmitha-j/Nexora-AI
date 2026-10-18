@@ -1,0 +1,6 @@
+.env
+.venv/
+.venv_nexora/
+venv/
+__pycache__/
+*.pyc
