@@ -20,7 +20,13 @@ from nexora.limits import RateLimiter
 from nexora.prompts import BASE_SYSTEM, rag_system
 from nexora.providers import ChatMessage, ProviderError, Usage, build_provider, candidate_models, stream_with_fallback
 from nexora.rag.ingest import UnsupportedFileError
-from nexora.rag.service import RagService, format_context, format_sources
+from nexora.rag.service import (
+    MAX_CHUNKS_PER_DOCUMENT,
+    DocumentTooLargeError,
+    RagService,
+    format_context,
+    format_sources,
+)
 
 load_dotenv()
 
@@ -93,8 +99,28 @@ def current_owner() -> str | None:
     return user.identifier if user else None
 
 
+# Visitors who aren't signed in get a private document space tied to their chat session.
+# It is deleted when the chat ends, and anything older than PUBLIC_DOC_TTL_HOURS is purged.
+SESSION_OWNER_PREFIX = "session:"
+PUBLIC_MAX_DOCS = 5
+PUBLIC_MAX_CHUNKS = 300  # roughly 300 KB of text, to protect the free embedding quota
+PUBLIC_DOC_TTL_HOURS = 24
+PURGE_INTERVAL_SECONDS = 3600
+_last_purge = 0.0
+
+
+def doc_owner() -> str:
+    """Who documents belong to: the signed-in user, or else this chat session.
+    (Usernames can't contain ':', so the two can never collide.)"""
+    return current_owner() or f"{SESSION_OWNER_PREFIX}{cl.context.session.id}"
+
+
+def is_anonymous() -> bool:
+    return current_owner() is None
+
+
 def rate_limit_key() -> str:
-    return current_owner() or f"session:{cl.context.session.id}"
+    return doc_owner()
 
 
 async def ensure_rag_schema() -> None:
@@ -105,10 +131,26 @@ async def ensure_rag_schema() -> None:
             _schema_done = True
 
 
+async def purge_stale_session_docs() -> None:
+    """Delete anonymous sessions' documents older than PUBLIC_DOC_TTL_HOURS, at most hourly.
+    on_chat_end normally removes them; this catches sessions that never ended cleanly."""
+    global _last_purge
+    if time.monotonic() - _last_purge < PURGE_INTERVAL_SECONDS:
+        return
+    _last_purge = time.monotonic()
+    try:
+        removed = await rag.store.purge_stale(SESSION_OWNER_PREFIX, PUBLIC_DOC_TTL_HOURS)
+        if removed:
+            logger.info("Purged %d expired session documents", removed)
+    except Exception:
+        logger.exception("Purging expired session documents failed")
+
+
 async def rag_ready() -> bool:
     """Make sure document tables exist; tell the user if the database is unreachable."""
     try:
         await ensure_rag_schema()
+        await purge_stale_session_docs()
         return True
     except Exception:
         logger.exception("Document storage unavailable")
@@ -116,9 +158,27 @@ async def rag_ready() -> bool:
         return False
 
 
+async def has_documents() -> bool:
+    """Whether this chat's owner has any documents, so questions aren't embedded (using
+    quota) for visitors who never uploaded anything. Cached per chat session."""
+    count = cl.user_session.get("doc_count")
+    if count is None:
+        if is_anonymous():
+            count = 0  # a new session can't have documents yet
+        else:
+            try:
+                await ensure_rag_schema()
+                count = len(await rag.store.list_documents(doc_owner()))
+            except Exception:
+                logger.exception("Couldn't count documents")
+                return False
+        cl.user_session.set("doc_count", count)
+    return count > 0
+
+
 def available_help() -> str:
     signed_in = current_owner() is not None
-    return help_text(docs=rag is not None and signed_in, build=jobs is not None and signed_in)
+    return help_text(docs=rag is not None, build=jobs is not None and signed_in)
 
 
 async def say(content: str) -> None:
@@ -134,7 +194,7 @@ async def init_session(history: list[ChatMessage]) -> bool:
     cl.user_session.set("usage", {"input": 0, "output": 0, "requests": 0})
     cl.user_session.set("provider", settings.default_provider)
     cl.user_session.set("model", "")
-    docs_available = rag is not None and current_owner() is not None
+    docs_available = rag is not None
     cl.user_session.set("use_docs", docs_available)
 
     widgets = [
@@ -160,20 +220,43 @@ async def init_session(history: list[ChatMessage]) -> bool:
 @cl.on_chat_start
 async def on_chat_start():
     docs_available = await init_session([])
-    owner = current_owner()
+    signed_in = current_owner() is not None
     lines = [
         "# Welcome to Nexora AI",
         f"Chatting with **{settings.default_provider}** "
         f"(`{settings.models[settings.default_provider]}`). Change it in the settings panel.",
     ]
-    if docs_available:
+    if docs_available and is_anonymous():
+        lines.append(
+            "Attach PDF, text or Markdown files to a message to ask questions about them. "
+            f"Up to {PUBLIC_MAX_DOCS} files per chat. They're private to this chat and deleted when you start "
+            f"a new chat, or after {PUBLIC_DOC_TTL_HOURS} hours."
+        )
+    elif docs_available:
         lines.append("Attach PDF, text or Markdown files to a message to add them to your knowledge base.")
-    elif rag is not None:
-        lines.append("Sign-in is required to use documents.")
-    if jobs is not None and owner is not None:
+    if jobs is not None and signed_in:
         lines.append("Use `/build <idea>` to have a MetaGPT software team plan and write a project.")
     lines.append("\nCommands:\n" + available_help())
     await say("\n\n".join(lines))
+
+
+@cl.on_chat_end
+async def on_chat_end():
+    """Delete an anonymous chat's documents when the visitor starts a new chat.
+
+    Chainlit also calls this on any websocket disconnect, including brief network drops
+    after which the browser reconnects to the same session; deleting then would lose the
+    visitor's files. Only "New chat" marks the session to_clear, so closed tabs and lost
+    connections are left to the PUBLIC_DOC_TTL_HOURS purge instead."""
+    if rag is None or not is_anonymous() or not cl.user_session.get("doc_count"):
+        return
+    if not getattr(cl.context.session, "to_clear", False):
+        return
+    try:
+        removed = await rag.store.delete_owner(doc_owner())
+        logger.info("Deleted %d documents from an ended anonymous chat", removed)
+    except Exception:
+        logger.exception("Couldn't delete an ended chat's documents (the hourly purge will retry)")
 
 
 @cl.on_chat_resume
@@ -252,11 +335,9 @@ async def chat(text: str) -> None:
 
     history: list[ChatMessage] = cl.user_session.get("history")
     system, hits = BASE_SYSTEM, []
-    owner = current_owner()
-    if rag is not None and owner and cl.user_session.get("use_docs"):
+    if rag is not None and cl.user_session.get("use_docs") and await has_documents():
         try:
-            await ensure_rag_schema()
-            hits = await rag.retrieve(owner, text)
+            hits = await rag.retrieve(doc_owner(), text)
         except Exception:
             logger.exception("Retrieval failed")
             await say("Couldn't search your documents right now, so this answer doesn't use them.")
@@ -309,25 +390,28 @@ async def chat(text: str) -> None:
 
 
 async def handle_uploads(files) -> None:
-    owner = current_owner()
+    owner = doc_owner()
     if rag is None:
         await say("Document upload isn't enabled on this server (DATABASE_URL is not set).")
         return
-    if owner is None:
-        await say("Sign in to upload documents.")
-        return
     if not await rag_ready():
         return
+    anonymous = is_anonymous()
+    existing = len(await rag.store.list_documents(owner)) if anonymous else 0
     for element in files:
         path = Path(element.path)
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > settings.max_upload_mb:
             await say(f"**{element.name}** is {size_mb:.1f} MB; the limit is {settings.max_upload_mb} MB.")
             continue
+        if anonymous and existing >= PUBLIC_MAX_DOCS:
+            await say(f"This chat already has {PUBLIC_MAX_DOCS} documents. Remove one with `/forget <n>` first.")
+            break
         async with cl.Step(name=f"Indexing {element.name}") as step:
             try:
-                result = await rag.ingest(owner, element.name, path)
-            except UnsupportedFileError as exc:
+                limit = PUBLIC_MAX_CHUNKS if anonymous else MAX_CHUNKS_PER_DOCUMENT
+                result = await rag.ingest(owner, element.name, path, max_chunks=limit)
+            except (UnsupportedFileError, DocumentTooLargeError) as exc:
                 step.output = str(exc)
                 await say(str(exc))
                 continue
@@ -338,6 +422,9 @@ async def handle_uploads(files) -> None:
                 continue
             verb = "Re-indexed" if result.replaced else "Indexed"
             step.output = f"{verb} {result.chunk_count} chunks"
+        if not result.replaced:
+            existing += 1
+        cl.user_session.set("doc_count", (cl.user_session.get("doc_count") or 0) + (0 if result.replaced else 1))
         await say(f"{verb} **{result.filename}** ({result.chunk_count} chunks). Ask me about it.")
 
 
@@ -353,9 +440,9 @@ async def handle_command(name: str, arg: str) -> None:
         await handle_build(arg)
         return
 
-    owner = current_owner()
-    if rag is None or owner is None:
-        await say("Documents need sign-in and a configured database.")
+    owner = doc_owner()
+    if rag is None:
+        await say("Documents aren't enabled on this server (DATABASE_URL is not set).")
         return
     if not await rag_ready():
         return
@@ -379,6 +466,8 @@ async def handle_command(name: str, arg: str) -> None:
         ).send()
         if res and res.get("payload", {}).get("ok"):
             deleted = await rag.store.delete_document(owner, doc.id)
+            if deleted:
+                cl.user_session.set("doc_count", max(0, len(documents) - 1))
             await say(f"Deleted **{doc.filename}**." if deleted else "That document was already gone.")
         else:
             await say("Kept it.")

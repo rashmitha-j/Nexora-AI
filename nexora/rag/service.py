@@ -14,6 +14,10 @@ from nexora.rag.store import DocumentStore, Hit
 MAX_CHUNKS_PER_DOCUMENT = 2000
 
 
+class DocumentTooLargeError(ValueError):
+    pass
+
+
 @dataclass
 class IngestResult:
     filename: str
@@ -31,12 +35,16 @@ class RagService:
         # 768 dims, unrelated questions measured 0.45-0.53 and real matches 0.59-0.79.
         self.min_score = min_score
 
-    async def ingest(self, owner: str, filename: str, path: Path) -> IngestResult:
+    async def ingest(
+        self, owner: str, filename: str, path: Path, max_chunks: int = MAX_CHUNKS_PER_DOCUMENT
+    ) -> IngestResult:
         sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         existing = await self.store.find_by_hash(owner, sha256)
         chunks = chunk_sections(extract_sections(path, filename))
-        if len(chunks) > MAX_CHUNKS_PER_DOCUMENT:
-            raise ValueError(f"{filename} is too large ({len(chunks)} chunks; limit {MAX_CHUNKS_PER_DOCUMENT}).")
+        if len(chunks) > max_chunks:
+            raise DocumentTooLargeError(
+                f"{filename} is too large to index here ({len(chunks)} sections; the limit is {max_chunks})."
+            )
         embeddings = await self.embedder.embed_documents([c.text for c in chunks])
         # Re-uploading the same file re-indexes it instead of duplicating it.
         if existing:

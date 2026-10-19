@@ -58,7 +58,11 @@ Put the printed values in `NEXORA_USERS` (comma-separate several users) and `CHA
 
 Create a Postgres database with pgvector (Neon and Supabase both support it), set `DATABASE_URL`, and restart. Paste Neon's connection string as it is: options that only `psql` understands, such as `channel_binding`, are removed automatically. All tables are created on first use with `CREATE TABLE IF NOT EXISTS`; nothing is ever dropped. `EMBEDDING_DIM` is fixed when the tables are created, so changing it later needs a fresh database.
 
-Both features need sign-in, because documents and history belong to a user. Without `NEXORA_USERS`, the app still works as a plain public chat and stores nothing.
+**Without sign-in (public site):** anyone can attach documents, but each chat gets its own private document space: up to 5 files of about 300 KB of text each, never visible to other visitors. They're deleted when the visitor clicks **New chat**, and anything older than 24 hours is purged automatically. A closed tab or a dropped connection doesn't delete them straight away, because Chainlit lets the browser reconnect to the same chat. Chat history isn't saved for anonymous visitors.
+
+**With sign-in (`NEXORA_USERS`):** each user keeps their documents across chats, and their conversations are saved and listed in the sidebar.
+
+To save the free embedding quota, a question is only matched against documents when that chat actually has some.
 
 If the database is unreachable, chat keeps working: history pauses for 30 seconds at a time and document commands say storage is unavailable.
 

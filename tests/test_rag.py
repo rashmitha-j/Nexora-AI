@@ -160,3 +160,13 @@ def test_ingest_retrieve_is_owner_scoped_and_reindexes(tmp_path):
     assert [h.filename for h in alice_apple] == ["fruit.txt"]
     assert [h.filename for h in bob_hits] == ["secret.txt"]
     assert count == 1
+
+
+def test_ingest_rejects_documents_over_the_chunk_limit(tmp_path):
+    from nexora.rag.service import DocumentTooLargeError
+
+    service = RagService(FakeStore(), FakeEmbedder(), top_k=3)
+    big = make_file(tmp_path, "big.txt", "\n\n".join("apple " * 200 for _ in range(10)))
+    with pytest.raises(DocumentTooLargeError, match="limit is 2"):
+        asyncio.run(service.ingest("alice", "big.txt", big, max_chunks=2))
+    assert asyncio.run(service.store.list_documents("alice")) == []

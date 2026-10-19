@@ -66,3 +66,30 @@ def test_chat_history_schema_and_thread_round_trip():
     page, author = asyncio.run(scenario())
     assert [t["name"] for t in page.data] == ["Integration"]
     assert author == identifier
+
+
+def test_session_cleanup_delete_owner_and_purge_stale():
+    from nexora.rag.store import PgVectorStore
+
+    session, keeper = f"session:{uuid.uuid4().hex}", f"test-{uuid.uuid4().hex[:8]}"
+
+    async def scenario():
+        store = PgVectorStore(DB_URL, dim=DIM)
+        await store.ensure_schema()
+        await store.add_document(session, "a.md", uuid.uuid4().hex, "fake", [Chunk(0, "x", None)], [UNIT])
+        await store.add_document(session, "b.md", uuid.uuid4().hex, "fake", [Chunk(0, "y", None)], [UNIT])
+        await store.add_document(keeper, "c.md", uuid.uuid4().hex, "fake", [Chunk(0, "z", None)], [UNIT])
+        fresh_purged = await store.purge_stale("session:", 24)  # nothing is old enough yet
+        pool = await store._get_pool()
+        await pool.execute(
+            "UPDATE nexora_documents SET created_at = now() - interval '25 hours' WHERE owner_id = $1", session
+        )
+        old_purged = await store.purge_stale("session:", 24)
+        left = await store.list_documents(session)
+        removed_keeper = await store.delete_owner(keeper)
+        await store.close()
+        return fresh_purged, old_purged, left, removed_keeper
+
+    fresh_purged, old_purged, left, removed_keeper = asyncio.run(scenario())
+    assert fresh_purged == 0 and old_purged == 2 and left == []
+    assert removed_keeper == 1  # purge only touched session:* owners

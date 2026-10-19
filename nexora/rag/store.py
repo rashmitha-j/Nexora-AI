@@ -50,6 +50,10 @@ class DocumentStore(Protocol):
 
     async def chunks_for_owner(self, owner: str) -> list[tuple[int, str]]: ...
 
+    async def delete_owner(self, owner: str) -> int: ...
+
+    async def purge_stale(self, owner_prefix: str, max_age_hours: int) -> int: ...
+
     async def update_embeddings(self, owner: str, model: str, rows: list[tuple[int, list[float]]]) -> None: ...
 
     async def search(self, owner: str, query_embedding: list[float], k: int) -> list[Hit]: ...
@@ -194,6 +198,22 @@ class PgVectorStore:
             "DELETE FROM nexora_documents WHERE owner_id = $1 AND id = $2", owner, uuid.UUID(document_id)
         )
         return status != "DELETE 0"
+
+    async def delete_owner(self, owner: str) -> int:
+        pool = await self._get_pool()
+        status = await pool.execute("DELETE FROM nexora_documents WHERE owner_id = $1", owner)
+        return int(status.split()[-1])
+
+    async def purge_stale(self, owner_prefix: str, max_age_hours: int) -> int:
+        """Delete documents of temporary owners (e.g. anonymous sessions) older than the limit."""
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "DELETE FROM nexora_documents "
+            "WHERE starts_with(owner_id, $1) AND created_at < now() - make_interval(hours => $2)",
+            owner_prefix,
+            max_age_hours,
+        )
+        return int(status.split()[-1])
 
     async def chunks_for_owner(self, owner: str) -> list[tuple[int, str]]:
         pool = await self._get_pool()
