@@ -1,6 +1,19 @@
 .env
 .venv/
 .venv_nexora/
+.venv-worker/
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Chainlit runtime files (config.toml is committed)
+.files/
+.chainlit/translations/
+
+# MetaGPT worker output
+worker-jobs/
+
+# MetaGPT log files when imported from the repo root
+logs/
