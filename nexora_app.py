@@ -1,4 +1,5 @@
 ﻿import asyncio
+import logging
 import os
 
 import chainlit as cl
@@ -7,6 +8,9 @@ from google import genai
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nexora")
+
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError(
@@ -14,7 +18,7 @@ if not api_key:
     )
 
 client = genai.Client(api_key=api_key)
-MODEL = "gemini-3.8-flash"
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 @cl.on_chat_start
 async def start():
@@ -36,6 +40,8 @@ async def main(message: cl.Message):
         answer = response.text or "Gemini returned an empty response."
         await cl.Message(content=answer).send()
     except Exception:
+        # Full error goes to the server logs; the user sees a generic message.
+        logger.exception("Gemini request failed (model=%s)", MODEL)
         await cl.Message(
             content="I couldn't get a response. Check your API key, "
             "internet connection, and Gemini API access."
