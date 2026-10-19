@@ -150,7 +150,7 @@ The live service is a Render **free web service** with:
 ## Known limitations (free tier)
 
 - **Cold starts.** Render's free web services sleep after 15 minutes without traffic; the first visit afterwards takes about a minute.
-- **Gemini quotas.** The free Gemini tier limits requests per minute and per day, **per model**. When the main model (`gemini-3.5-flash`) hits its quota or is overloaded, Nexora automatically retries with `GEMINI_FALLBACK_MODELS` (default `gemini-3.7-flash`, then `gemini-3.1-flash-lite`). Only when all of them are exhausted do users see a "rate limit or quota reached" message. `gemini-2.5-flash` no longer works for new API keys.
+- **Gemini quotas.** The free Gemini tier limits requests per minute and per day, **per model**. When the main model (`gemini-3.5-flash`) hits its quota or is overloaded, Nexora automatically retries with `GEMINI_FALLBACK_MODELS` (default `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, then `gemini-3.1-flash-lite`). Only when all of them are exhausted do users see a "rate limit or quota reached" message. `gemini-2.5-flash` no longer works for new API keys.
 - **Neon free plan.** Storage is limited (0.5 GB at the time of writing) and the database suspends when idle, so the first query after a pause is slower. Pool sizes are kept small (history 5, documents 3 connections).
 - **Single instance.** Rate limits and the job queue live in memory, so run one instance. With more instances, move them to Redis.
 - **MetaGPT** needs more than the free plan's 512 MB of RAM, so `/build` is only available when you run the worker yourself.

@@ -193,7 +193,7 @@ def test_stream_success():
 
 
 def test_stream_retries_transient_error_before_first_chunk():
-    provider = FakeProvider([[Status(429)], [Status(503)], ["ok"]])
+    provider = FakeProvider([[Status(429)], [Status(502)], ["ok"]])
     text, _ = asyncio.run(collect(provider))
     assert text == "ok" and provider.calls == 3
 
@@ -316,7 +316,9 @@ def test_candidate_models(env):
 
     env.setenv("GEMINI_API_KEY", "k")
     s = config_mod.load_settings()
-    assert candidate_models(s, "gemini", "") == ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
+    assert candidate_models(s, "gemini", "") == [
+        "gemini-3.5-flash"
+    ] + "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite".split(",")
     assert candidate_models(s, "gemini", "my-model") == ["my-model"]
     env.setenv("GEMINI_FALLBACK_MODELS", "")
     assert candidate_models(config_mod.load_settings(), "gemini", None) == ["gemini-3.5-flash"]
@@ -384,3 +386,9 @@ def test_login_throttle_blocks_after_repeated_failures():
     t.record_failure("alice")
     t.reset("alice")
     assert not t.blocked("alice")
+
+
+def test_overload_falls_back_without_retrying_same_model():
+    err = classify(Status(503), "gemini")
+    assert err.retryable is False and err.fallback is True
+    assert classify(Status(500), "gemini").retryable is True

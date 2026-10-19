@@ -100,6 +100,10 @@ def classify(exc: BaseException, provider: str) -> ProviderError:
             fallback=True,
             retry_after_s=retry_after,
         )
+    if status == 503:
+        # "Model is experiencing high demand": retrying the same model seconds later rarely
+        # helps and wastes time, so move straight on to the next fallback model.
+        return ProviderError(f"{provider} is overloaded right now. Please try again shortly.", fallback=True)
     if status is not None and status >= 500:
         return ProviderError(f"{provider} had a server error. Please try again.", retryable=True)
     if status == 400:
