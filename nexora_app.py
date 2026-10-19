@@ -5,6 +5,8 @@ Run locally: chainlit run nexora_app.py
 
 import asyncio
 import logging
+import os
+import secrets
 import time
 from pathlib import Path
 
@@ -12,7 +14,7 @@ import chainlit as cl
 from chainlit.input_widget import Select, Switch, TextInput
 from dotenv import load_dotenv
 
-from nexora.auth import authenticate, parse_users
+from nexora.auth import LoginThrottle, authenticate, clean_env_value, parse_users_lenient
 from nexora.commands import help_text, parse_command
 from nexora.config import load_settings
 from nexora.jobs import JobClient, JobClientError
@@ -63,12 +65,37 @@ JOB_POLL_SECONDS = 5
 JOB_WATCH_LIMIT_SECONDS = 20 * 60
 
 if settings.auth_enabled:
-    _users = parse_users(settings.users_spec)
+    # A sign-in misconfiguration must not crash the site (it did once on Render). Bad entries
+    # are skipped and logged; with no valid entries, nobody can sign in, but nothing opens up.
+    _users, _user_errors = parse_users_lenient(settings.users_spec)
+    for _error in _user_errors:
+        logger.error("NEXORA_USERS: %s", _error)
+    if not _users:
+        logger.error("NEXORA_USERS has no valid accounts: sign-in is enabled but nobody can log in.")
+
+    _secret = clean_env_value(os.getenv("CHAINLIT_AUTH_SECRET", ""), "CHAINLIT_AUTH_SECRET")
+    if not _secret:
+        # Chainlit checks this right after importing the app. A per-process secret keeps the
+        # site up; the only cost is that everyone is signed out when the service restarts.
+        _secret = secrets.token_urlsafe(48)
+        logger.warning("CHAINLIT_AUTH_SECRET is not set; using a temporary one (sign-ins reset on restart).")
+    os.environ["CHAINLIT_AUTH_SECRET"] = _secret
+
+    _login_throttle = LoginThrottle()
 
     @cl.password_auth_callback
     async def password_auth(username: str, password: str):
+        username = (username or "").strip()
+        if not username or not password or _login_throttle.blocked(username):
+            logger.warning("Sign-in refused for %r (blocked or empty)", username[:50])
+            return None
         ok = await asyncio.to_thread(authenticate, _users, username, password)
-        return cl.User(identifier=username, metadata={"provider": "password"}) if ok else None
+        if not ok:
+            _login_throttle.record_failure(username)
+            logger.info("Failed sign-in for %r", username[:50])
+            return None
+        _login_throttle.reset(username)
+        return cl.User(identifier=username, metadata={"provider": "password"})
 
 
 # Chainlit enables its own asyncpg data layer whenever DATABASE_URL is set, without
@@ -297,12 +324,20 @@ async def on_settings_update(new_settings: dict):
 
 @cl.on_message
 async def on_message(message: cl.Message):
+    # One request at a time per chat: a second message sent while a reply is still being
+    # generated would otherwise start another (quota-consuming) model call in parallel.
+    if cl.user_session.get("busy"):
+        await say("I'm still working on your previous message. Please wait for it to finish.")
+        return
+    cl.user_session.set("busy", True)
     try:
         await handle_message(message)
     except Exception:
         # Last line of defence: log the details, never leave the user without a reply.
         logger.exception("Unhandled error while handling a message")
         await say("Something went wrong on our side. Please try again in a moment.")
+    finally:
+        cl.user_session.set("busy", False)
 
 
 async def handle_message(message: cl.Message) -> None:

@@ -160,5 +160,3 @@ def validate(settings: Settings) -> None:
         raise ConfigError(f"DATABASE_URL is set but EMBEDDING_PROVIDER={settings.embedding_provider!r} has no API key.")
     if bool(settings.worker_url) != bool(settings.worker_token):
         raise ConfigError("Set both METAGPT_WORKER_URL and METAGPT_WORKER_TOKEN, or neither.")
-    if settings.auth_enabled and not os.getenv("CHAINLIT_AUTH_SECRET"):
-        raise ConfigError("NEXORA_USERS is set, so CHAINLIT_AUTH_SECRET is required (run: chainlit create-secret).")

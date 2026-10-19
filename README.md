@@ -54,6 +54,15 @@ chainlit create-secret            # prints CHAINLIT_AUTH_SECRET=...
 
 Put the printed values in `NEXORA_USERS` (comma-separate several users) and `CHAINLIT_AUTH_SECRET`.
 
+Turning sign-in on makes the whole site login-only (Chainlit can't mix public and signed-in visitors). Sign-out is in the user menu (top right).
+
+Safety built in:
+- Five wrong passwords for a username block further attempts for 15 minutes.
+- A malformed `NEXORA_USERS` entry is skipped and logged (the rest still work) instead of crashing the site; with no valid entries nobody can sign in.
+- Surrounding quotes or a pasted `NAME=` prefix in either variable are tolerated.
+- If `CHAINLIT_AUTH_SECRET` is missing, a temporary one is used and everyone is signed out on each restart, so set it.
+- Only one message per chat is processed at a time, so double-sending can't start parallel model calls.
+
 ### Turn on documents and chat history
 
 Create a Postgres database with pgvector (Neon and Supabase both support it), set `DATABASE_URL`, and restart. Paste Neon's connection string as it is: options that only `psql` understands, such as `channel_binding`, are removed automatically. All tables are created on first use with `CREATE TABLE IF NOT EXISTS`; nothing is ever dropped. `EMBEDDING_DIM` is fixed when the tables are created, so changing it later needs a fresh database.

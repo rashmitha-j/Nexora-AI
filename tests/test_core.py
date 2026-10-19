@@ -62,11 +62,11 @@ def test_config_worker_needs_url_and_token(env):
         config_mod.load_settings()
 
 
-def test_config_auth_needs_chainlit_secret(env):
+def test_config_auth_no_longer_requires_secret_at_validation(env):
+    # The app supplies a temporary secret instead of crashing (see nexora_app.py).
     env.setenv("GEMINI_API_KEY", "k")
     env.setenv("NEXORA_USERS", "a:x")
-    with pytest.raises(config_mod.ConfigError, match="CHAINLIT_AUTH_SECRET"):
-        config_mod.load_settings()
+    assert config_mod.load_settings().auth_enabled
 
 
 def test_config_bad_integer(env):
@@ -346,3 +346,41 @@ def test_exhausted_model_is_skipped_until_reset():
     # When every model is exhausted, the last one is still tried so the user gets an answer.
     assert [p.model for p in prov.available([first])] == ["gemini-a"]
     prov._exhausted_until.clear()
+
+
+# -- sign-in hardening -------------------------------------------------------
+
+
+def test_clean_env_value_undoes_paste_mistakes():
+    from nexora.auth import clean_env_value
+
+    assert clean_env_value('  "abc"  ', "CHAINLIT_AUTH_SECRET") == "abc"
+    assert clean_env_value('CHAINLIT_AUTH_SECRET="abc"', "CHAINLIT_AUTH_SECRET") == "abc"
+    assert clean_env_value("abc", "CHAINLIT_AUTH_SECRET") == "abc"
+    assert clean_env_value("", "X") == ""
+
+
+def test_parse_users_lenient_skips_bad_entries_without_leaking():
+    from nexora.auth import parse_users_lenient
+
+    good = hash_password("pw-alice-123", iterations=1000)
+    users, errors = parse_users_lenient(f'"alice:{good}", bob:not-a-hash, , carol')
+    assert users == {"alice": good}
+    assert len(errors) == 2 and all("not-a-hash" not in e for e in errors)
+    assert authenticate(users, "alice", "pw-alice-123")
+
+
+def test_login_throttle_blocks_after_repeated_failures():
+    from nexora.auth import LoginThrottle
+
+    now = [0.0]
+    t = LoginThrottle(max_failures=3, window_s=60, clock=lambda: now[0])
+    for _ in range(3):
+        assert not t.blocked("alice")
+        t.record_failure("alice")
+    assert t.blocked("alice") and not t.blocked("bob")
+    now[0] = 61
+    assert not t.blocked("alice")
+    t.record_failure("alice")
+    t.reset("alice")
+    assert not t.blocked("alice")
