@@ -1,8 +1,12 @@
-# Render Blueprint: the Chainlit web app plus the MetaGPT worker.
+# Render Blueprint for the free web service. (The live service was created by hand with
+# the same build/start commands; this file documents them and can recreate the service.)
 # Secrets marked `sync: false` are entered in the Render dashboard; never commit them.
+#
+# The MetaGPT worker is not included: it needs more than the free plan's 512 MB of RAM.
+# Run it locally instead (see README) and leave METAGPT_WORKER_URL unset on Render.
 services:
   - type: web
-    name: nexora-ai
+    name: Nexora-AI
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -14,48 +18,15 @@ services:
       - key: NEXORA_PROVIDER
         value: gemini
       - key: GEMINI_MODEL
-        value: gemini-3.8-flash
+        value: gemini-3.5-flash
       - key: GEMINI_API_KEY
         sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      # Postgres with pgvector (e.g. Neon or Supabase). Leave empty to disable documents.
+      # Neon connection string (Dashboard -> Connect). Enables documents and chat history.
       - key: DATABASE_URL
         sync: false
       # Sign-in: "user:<hash>" pairs from `python -m nexora.auth`, comma separated.
+      # Documents and chat history are only available to signed-in users.
       - key: NEXORA_USERS
         sync: false
       - key: CHAINLIT_AUTH_SECRET
         generateValue: true
-      # Public URL of the worker service below, e.g. https://nexora-metagpt-worker.onrender.com
-      - key: METAGPT_WORKER_URL
-        sync: false
-      - key: METAGPT_WORKER_TOKEN
-        fromService:
-          type: web
-          name: nexora-metagpt-worker
-          envVarKey: METAGPT_WORKER_TOKEN
-
-  - type: web
-    name: nexora-metagpt-worker
-    runtime: python
-    # MetaGPT needs a lot of memory; the free plan's 512 MB may not be enough.
-    plan: free
-    buildCommand: PYTHON=python sh worker/install.sh
-    startCommand: uvicorn worker.app:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /healthz
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: METAGPT_WORKER_TOKEN
-        generateValue: true
-      - key: METAGPT_API_TYPE
-        value: gemini
-      - key: METAGPT_MODEL
-        value: gemini-3.8-flash
-      - key: METAGPT_API_KEY
-        sync: false
-      - key: METAGPT_JOB_TIMEOUT_SECONDS
-        value: "900"

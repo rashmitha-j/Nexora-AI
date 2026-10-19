@@ -57,13 +57,29 @@ if settings.auth_enabled:
         return cl.User(identifier=username, metadata={"provider": "password"}) if ok else None
 
 
+# Chainlit enables its own asyncpg data layer whenever DATABASE_URL is set, without
+# creating its tables. Always register ours instead. Chat history is only useful (and
+# only visible) for signed-in users, so anonymous sessions aren't stored.
+history_enabled = bool(settings.database_url) and settings.auth_enabled
+if settings.database_url:
+
+    @cl.data_layer
+    def data_layer():
+        if not history_enabled:
+            return None
+        from nexora.history import NexoraDataLayer
+
+        return NexoraDataLayer(settings.database_url)
+
+
 logger.info(
-    "Nexora AI starting: providers=%s default=%s rag=%s jobs=%s auth=%s",
+    "Nexora AI starting: providers=%s default=%s rag=%s jobs=%s auth=%s history=%s",
     settings.providers,
     settings.default_provider,
     settings.rag_enabled,
     settings.jobs_enabled,
     settings.auth_enabled,
+    history_enabled,
 )
 
 
@@ -89,6 +105,17 @@ async def ensure_rag_schema() -> None:
             _schema_done = True
 
 
+async def rag_ready() -> bool:
+    """Make sure document tables exist; tell the user if the database is unreachable."""
+    try:
+        await ensure_rag_schema()
+        return True
+    except Exception:
+        logger.exception("Document storage unavailable")
+        await say("Document storage is unavailable right now (the database didn't respond). Chat still works.")
+        return False
+
+
 def available_help() -> str:
     signed_in = current_owner() is not None
     return help_text(docs=rag is not None and signed_in, build=jobs is not None and signed_in)
@@ -101,14 +128,13 @@ async def say(content: str) -> None:
 # -- lifecycle ---------------------------------------------------------------
 
 
-@cl.on_chat_start
-async def on_chat_start():
-    cl.user_session.set("history", [])
+async def init_session(history: list[ChatMessage]) -> bool:
+    """Set up per-chat state and the settings panel. Returns whether documents are available."""
+    cl.user_session.set("history", history)
     cl.user_session.set("usage", {"input": 0, "output": 0, "requests": 0})
     cl.user_session.set("provider", settings.default_provider)
     cl.user_session.set("model", "")
-    owner = current_owner()
-    docs_available = rag is not None and owner is not None
+    docs_available = rag is not None and current_owner() is not None
     cl.user_session.set("use_docs", docs_available)
 
     widgets = [
@@ -128,7 +154,13 @@ async def on_chat_start():
     if docs_available:
         widgets.append(Switch(id="use_docs", label="Answer from my documents", initial=True))
     await cl.ChatSettings(widgets).send()
+    return docs_available
 
+
+@cl.on_chat_start
+async def on_chat_start():
+    docs_available = await init_session([])
+    owner = current_owner()
     lines = [
         "# Welcome to Nexora AI",
         f"Chatting with **{settings.default_provider}** "
@@ -142,6 +174,15 @@ async def on_chat_start():
         lines.append("Use `/build <idea>` to have a MetaGPT software team plan and write a project.")
     lines.append("\nCommands:\n" + available_help())
     await say("\n\n".join(lines))
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: dict):
+    """Reopen a saved conversation from the history sidebar with its context restored."""
+    from nexora.history import history_from_steps
+
+    pairs = history_from_steps(thread.get("steps") or [], settings.history_turns)
+    await init_session([ChatMessage(role, text) for role, text in pairs])
 
 
 @cl.on_settings_update
@@ -160,6 +201,15 @@ async def on_settings_update(new_settings: dict):
 
 @cl.on_message
 async def on_message(message: cl.Message):
+    try:
+        await handle_message(message)
+    except Exception:
+        # Last line of defence: log the details, never leave the user without a reply.
+        logger.exception("Unhandled error while handling a message")
+        await say("Something went wrong on our side. Please try again in a moment.")
+
+
+async def handle_message(message: cl.Message) -> None:
     wait = limiter.check(rate_limit_key())
     if wait:
         await say(f"You're sending messages too quickly. Try again in {int(wait) + 1} seconds.")
@@ -260,7 +310,8 @@ async def handle_uploads(files) -> None:
     if owner is None:
         await say("Sign in to upload documents.")
         return
-    await ensure_rag_schema()
+    if not await rag_ready():
+        return
     for element in files:
         path = Path(element.path)
         size_mb = path.stat().st_size / (1024 * 1024)
@@ -300,7 +351,8 @@ async def handle_command(name: str, arg: str) -> None:
     if rag is None or owner is None:
         await say("Documents need sign-in and a configured database.")
         return
-    await ensure_rag_schema()
+    if not await rag_ready():
+        return
     documents = await rag.store.list_documents(owner)
     if name == "docs":
         if not documents:

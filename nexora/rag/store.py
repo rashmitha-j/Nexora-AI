@@ -3,6 +3,7 @@ can only retrieve, list or delete their own documents."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from typing import Protocol
@@ -85,127 +86,142 @@ def migrations(dim: int) -> list[str]:
     ]
 
 
+def _vec(values) -> list[float]:
+    """pgvector's asyncpg codec takes plain float lists, so numpy isn't needed."""
+    return [float(v) for v in values]
+
+
 class PgVectorStore:
-    def __init__(self, database_url: str, dim: int):
-        self._url = database_url
+    """asyncpg-backed store with a small pool. asyncpg works on every platform's event
+    loop, and the statement cache is off so Neon's PgBouncer pooler is safe."""
+
+    def __init__(self, database_url: str, dim: int, max_connections: int = 3):
+        from nexora.history import asyncpg_dsn
+
+        self._url = asyncpg_dsn(database_url)
         self._dim = dim
+        self._max = max_connections
+        self._pool = None
+        self._lock = asyncio.Lock()
 
-    async def _connect(self):
-        import psycopg
-        from pgvector.psycopg import register_vector_async
+    async def _get_pool(self):
+        import asyncpg
+        from pgvector.asyncpg import register_vector
 
-        conn = await psycopg.AsyncConnection.connect(self._url, connect_timeout=10)
-        try:
-            await register_vector_async(conn)
-        except Exception:
-            await conn.close()
-            raise
-        return conn
+        async with self._lock:
+            if self._pool is None:
+                self._pool = await asyncpg.create_pool(
+                    self._url,
+                    min_size=1,
+                    max_size=self._max,
+                    statement_cache_size=0,
+                    command_timeout=30,
+                    init=register_vector,
+                )
+        return self._pool
 
     async def ensure_schema(self) -> None:
-        import psycopg
+        import asyncpg
 
-        # The vector type must exist before register_vector_async can run.
-        async with await psycopg.AsyncConnection.connect(self._url, connect_timeout=10) as conn:
-            await conn.execute("CREATE TABLE IF NOT EXISTS nexora_schema_migrations (version integer PRIMARY KEY)")
-            # Serialise concurrent startups.
-            await conn.execute("SELECT pg_advisory_xact_lock(727274)")
-            cur = await conn.execute("SELECT coalesce(max(version), 0) FROM nexora_schema_migrations")
-            applied = (await cur.fetchone())[0]
-            for version, sql in enumerate(migrations(self._dim), start=1):
-                if version > applied:
-                    await conn.execute(sql)
-                    await conn.execute("INSERT INTO nexora_schema_migrations VALUES (%s)", (version,))
-            await conn.commit()
+        # The vector type must exist before pooled connections register its codec.
+        conn = await asyncpg.connect(self._url, statement_cache_size=0, timeout=10)
+        try:
+            async with conn.transaction():
+                await conn.execute("CREATE TABLE IF NOT EXISTS nexora_schema_migrations (version integer PRIMARY KEY)")
+                # Serialise concurrent startups.
+                await conn.execute("SELECT pg_advisory_xact_lock(727274)")
+                applied = await conn.fetchval("SELECT coalesce(max(version), 0) FROM nexora_schema_migrations")
+                for version, sql in enumerate(migrations(self._dim), start=1):
+                    if version > applied:
+                        await conn.execute(sql)
+                        await conn.execute("INSERT INTO nexora_schema_migrations VALUES ($1)", version)
+        finally:
+            await conn.close()
+
+    async def close(self) -> None:
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+
+    @staticmethod
+    def _info(row) -> DocumentInfo:
+        return DocumentInfo(str(row["id"]), row["filename"], row["chunk_count"], row["created_at"].isoformat())
 
     async def find_by_hash(self, owner: str, sha256: str) -> DocumentInfo | None:
-        async with await self._connect() as conn:
-            cur = await conn.execute(
-                "SELECT id, filename, chunk_count, created_at FROM nexora_documents "
-                "WHERE owner_id = %s AND sha256 = %s",
-                (owner, sha256),
-            )
-            row = await cur.fetchone()
-        return DocumentInfo(str(row[0]), row[1], row[2], row[3].isoformat()) if row else None
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT id, filename, chunk_count, created_at FROM nexora_documents WHERE owner_id = $1 AND sha256 = $2",
+            owner,
+            sha256,
+        )
+        return self._info(row) if row else None
 
     async def add_document(self, owner, filename, sha256, model, chunks, embeddings) -> str:
-        import numpy as np
-
         if len(chunks) != len(embeddings):
             raise ValueError("chunks and embeddings differ in length")
-        doc_id = str(uuid.uuid4())
-        async with await self._connect() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO nexora_documents (id, owner_id, filename, sha256, embedding_model, chunk_count) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (doc_id, owner, filename, sha256, model, len(chunks)),
-                )
-                async with conn.cursor() as cur:
-                    await cur.executemany(
-                        "INSERT INTO nexora_chunks (document_id, owner_id, chunk_index, page, content, embedding) "
-                        "VALUES (%s, %s, %s, %s, %s, %s)",
-                        [
-                            (doc_id, owner, c.index, c.page, c.text, np.asarray(e, dtype=np.float32))
-                            for c, e in zip(chunks, embeddings, strict=True)
-                        ],
-                    )
-        return doc_id
+        doc_id = uuid.uuid4()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "INSERT INTO nexora_documents (id, owner_id, filename, sha256, embedding_model, chunk_count) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                doc_id,
+                owner,
+                filename,
+                sha256,
+                model,
+                len(chunks),
+            )
+            await conn.executemany(
+                "INSERT INTO nexora_chunks (document_id, owner_id, chunk_index, page, content, embedding) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                [(doc_id, owner, c.index, c.page, c.text, _vec(e)) for c, e in zip(chunks, embeddings, strict=True)],
+            )
+        return str(doc_id)
 
     async def list_documents(self, owner: str) -> list[DocumentInfo]:
-        async with await self._connect() as conn:
-            cur = await conn.execute(
-                "SELECT id, filename, chunk_count, created_at FROM nexora_documents "
-                "WHERE owner_id = %s ORDER BY created_at",
-                (owner,),
-            )
-            rows = await cur.fetchall()
-        return [DocumentInfo(str(r[0]), r[1], r[2], r[3].isoformat()) for r in rows]
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT id, filename, chunk_count, created_at FROM nexora_documents "
+            "WHERE owner_id = $1 ORDER BY created_at",
+            owner,
+        )
+        return [self._info(r) for r in rows]
 
     async def delete_document(self, owner: str, document_id: str) -> bool:
-        async with await self._connect() as conn:
-            cur = await conn.execute(
-                "DELETE FROM nexora_documents WHERE owner_id = %s AND id = %s",
-                (owner, document_id),
-            )
-            await conn.commit()
-            return cur.rowcount > 0
+        pool = await self._get_pool()
+        status = await pool.execute(
+            "DELETE FROM nexora_documents WHERE owner_id = $1 AND id = $2", owner, uuid.UUID(document_id)
+        )
+        return status != "DELETE 0"
 
     async def chunks_for_owner(self, owner: str) -> list[tuple[int, str]]:
-        async with await self._connect() as conn:
-            cur = await conn.execute("SELECT id, content FROM nexora_chunks WHERE owner_id = %s ORDER BY id", (owner,))
-            return [(r[0], r[1]) for r in await cur.fetchall()]
+        pool = await self._get_pool()
+        rows = await pool.fetch("SELECT id, content FROM nexora_chunks WHERE owner_id = $1 ORDER BY id", owner)
+        return [(r["id"], r["content"]) for r in rows]
 
     async def update_embeddings(self, owner: str, model: str, rows: list[tuple[int, list[float]]]) -> None:
-        import numpy as np
-
-        async with await self._connect() as conn:
-            async with conn.transaction():
-                async with conn.cursor() as cur:
-                    await cur.executemany(
-                        "UPDATE nexora_chunks SET embedding = %s WHERE id = %s AND owner_id = %s",
-                        [(np.asarray(e, dtype=np.float32), cid, owner) for cid, e in rows],
-                    )
-                await conn.execute(
-                    "UPDATE nexora_documents SET embedding_model = %s WHERE owner_id = %s", (model, owner)
-                )
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.executemany(
+                "UPDATE nexora_chunks SET embedding = $1 WHERE id = $2 AND owner_id = $3",
+                [(_vec(e), cid, owner) for cid, e in rows],
+            )
+            await conn.execute("UPDATE nexora_documents SET embedding_model = $1 WHERE owner_id = $2", model, owner)
 
     async def search(self, owner: str, query_embedding: list[float], k: int) -> list[Hit]:
-        import numpy as np
-
-        async with await self._connect() as conn:
-            cur = await conn.execute(
-                "SELECT c.document_id, d.filename, c.chunk_index, c.page, c.content, "
-                "       1 - (c.embedding <=> %s) AS score "
-                "FROM nexora_chunks c JOIN nexora_documents d ON d.id = c.document_id "
-                "WHERE c.owner_id = %s "
-                "ORDER BY c.embedding <=> %s LIMIT %s",
-                (
-                    np.asarray(query_embedding, dtype=np.float32),
-                    owner,
-                    np.asarray(query_embedding, dtype=np.float32),
-                    k,
-                ),
-            )
-            rows = await cur.fetchall()
-        return [Hit(str(r[0]), r[1], r[2], r[3], r[4], float(r[5])) for r in rows]
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT c.document_id, d.filename, c.chunk_index, c.page, c.content, "
+            "       1 - (c.embedding <=> $1) AS score "
+            "FROM nexora_chunks c JOIN nexora_documents d ON d.id = c.document_id "
+            "WHERE c.owner_id = $2 "
+            "ORDER BY c.embedding <=> $1 LIMIT $3",
+            _vec(query_embedding),
+            owner,
+            k,
+        )
+        return [
+            Hit(str(r["document_id"]), r["filename"], r["chunk_index"], r["page"], r["content"], float(r["score"]))
+            for r in rows
+        ]

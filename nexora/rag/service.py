@@ -23,12 +23,12 @@ class IngestResult:
 
 
 class RagService:
-    def __init__(self, store: DocumentStore, embedder: Embedder, top_k: int, min_score: float = 0.6):
+    def __init__(self, store: DocumentStore, embedder: Embedder, top_k: int, min_score: float = 0.55):
         self.store = store
         self.embedder = embedder
         self.top_k = top_k
         # Cosine similarity below this is treated as irrelevant. With gemini-embedding-001 at
-        # 768 dims, unrelated text scores ~0.45-0.55 and real matches ~0.7+.
+        # 768 dims, unrelated questions measured 0.45-0.53 and real matches 0.59-0.79.
         self.min_score = min_score
 
     async def ingest(self, owner: str, filename: str, path: Path) -> IngestResult:

@@ -43,7 +43,7 @@ def test_config_defaults_with_gemini(env):
     env.setenv("GEMINI_API_KEY", "k")
     s = config_mod.load_settings()
     assert s.providers == ["gemini"]
-    assert s.models["gemini"] == "gemini-3.8-flash"
+    assert s.models["gemini"] == "gemini-3.5-flash"
     assert not s.rag_enabled and not s.jobs_enabled and not s.auth_enabled
 
 
@@ -85,8 +85,8 @@ def test_build_provider_rejects_unconfigured(env):
 def test_build_provider_uses_override_model(env):
     env.setenv("GEMINI_API_KEY", "k")
     s = config_mod.load_settings()
-    assert build_provider(s, "gemini", "gemini-3.5-flash").model == "gemini-3.5-flash"
-    assert build_provider(s, "gemini", "  ").model == "gemini-3.8-flash"
+    assert build_provider(s, "gemini", "gemini-3.8-flash").model == "gemini-3.8-flash"
+    assert build_provider(s, "gemini", "  ").model == "gemini-3.5-flash"
 
 
 # -- auth --------------------------------------------------------------------

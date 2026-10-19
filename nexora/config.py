@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_MODELS = {
-    "gemini": "gemini-3.8-flash",
+    "gemini": "gemini-3.5-flash",
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-4o-mini",
     "ollama": "llama3.1",
@@ -125,7 +125,7 @@ def load_settings() -> Settings:
         embedding_dim=_int("EMBEDDING_DIM", 768),
         max_upload_mb=_int("MAX_UPLOAD_MB", 10),
         rag_top_k=_int("RAG_TOP_K", 5),
-        rag_min_score=_float("RAG_MIN_SCORE", 0.6),
+        rag_min_score=_float("RAG_MIN_SCORE", 0.55),
         worker_url=_str("METAGPT_WORKER_URL").rstrip("/"),
         worker_token=_str("METAGPT_WORKER_TOKEN"),
         users_spec=_str("NEXORA_USERS"),
