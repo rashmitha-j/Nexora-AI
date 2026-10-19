@@ -39,6 +39,21 @@ async def subprocess_runner(job: Job, job_dir: Path) -> dict:
     # A per-job home keeps the server's own ~/.metagpt config (if any) out of the run.
     env["HOME"] = env["USERPROFILE"] = str(job_dir)
     env["PYTHONUNBUFFERED"] = "1"
+    # The child runs from the workspace, so make the worker package importable explicitly.
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, env.get("PYTHONPATH", "")) if p)
+    workspace = job_dir / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    # MetaGPT commits generated code with git. Give it a fixed identity; otherwise GitPython
+    # falls back to the OS user lookup, which fails in this stripped-down environment.
+    env.update(
+        GIT_AUTHOR_NAME="Nexora MetaGPT worker",
+        GIT_AUTHOR_EMAIL="metagpt-worker@nexora.invalid",
+        GIT_COMMITTER_NAME="Nexora MetaGPT worker",
+        GIT_COMMITTER_EMAIL="metagpt-worker@nexora.invalid",
+        USERNAME="nexora-worker",
+        LOGNAME="nexora-worker",
+    )
     log = open(job_dir / "log.txt", "wb")
     kwargs = (
         {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -53,7 +68,8 @@ async def subprocess_runner(job: Job, job_dir: Path) -> dict:
         stdout=log,
         stderr=subprocess.STDOUT,
         env=env,
-        cwd=str(Path(__file__).resolve().parent.parent),
+        # Run inside the job's workspace so any relative path MetaGPT uses stays in the sandbox.
+        cwd=str(workspace),
         **kwargs,
     )
     try:
