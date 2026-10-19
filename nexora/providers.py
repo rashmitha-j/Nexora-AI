@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -39,11 +41,19 @@ class ProviderError(RuntimeError):
     """A provider call failed. `user_message` is safe to show. `retryable`: worth retrying the
     same model. `fallback`: worth trying another model (quota, overload, timeouts)."""
 
-    def __init__(self, user_message: str, retryable: bool = False, fallback: bool | None = None):
+    def __init__(
+        self,
+        user_message: str,
+        retryable: bool = False,
+        fallback: bool | None = None,
+        retry_after_s: float | None = None,
+    ):
         super().__init__(user_message)
         self.user_message = user_message
         self.retryable = retryable
         self.fallback = retryable if fallback is None else fallback
+        # Set for daily-quota errors: how long until the model can be used again.
+        self.retry_after_s = retry_after_s
 
 
 class ChatProvider(Protocol):
@@ -78,11 +88,17 @@ def classify(exc: BaseException, provider: str) -> ProviderError:
         return ProviderError(f"{provider} doesn't recognise the configured model name.")
     if status == 429:
         # A daily quota won't recover in seconds; skip retries and go straight to a fallback model.
-        daily = "PerDay" in str(exc)
+        text = str(exc)
+        daily = "PerDay" in text
+        retry_after = None
+        if daily:
+            match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", text)
+            retry_after = float(match.group(1)) if match else 3600.0
         return ProviderError(
             f"{provider} rate limit or quota reached. Wait a moment and try again.",
             retryable=not daily,
             fallback=True,
+            retry_after_s=retry_after,
         )
     if status is not None and status >= 500:
         return ProviderError(f"{provider} had a server error. Please try again.", retryable=True)
@@ -266,6 +282,24 @@ def candidate_models(settings: Settings, name: str, override: str | None) -> lis
     return [primary] + [m for m in settings.fallback_models.get(name, []) if m != primary]
 
 
+# Models whose daily quota is used up, mapped to when they can be tried again. Skipping
+# them avoids a wasted failed request (and seconds of delay) on every message.
+_exhausted_until: dict[str, float] = {}
+MAX_SKIP_SECONDS = 24 * 3600
+
+
+def mark_exhausted(model: str, retry_after_s: float, clock=time.monotonic) -> None:
+    _exhausted_until[model] = clock() + min(max(retry_after_s, 60.0), MAX_SKIP_SECONDS)
+
+
+def available(providers: list[ChatProvider], clock=time.monotonic) -> list[ChatProvider]:
+    """Providers whose model isn't known to be out of quota. If all are, keep the last one
+    so the user still gets a real (quota) answer from the API."""
+    now = clock()
+    usable = [p for p in providers if _exhausted_until.get(p.model, 0.0) <= now]
+    return usable or providers[-1:]
+
+
 async def stream_with_fallback(
     providers: list[ChatProvider],
     system: str,
@@ -276,6 +310,7 @@ async def stream_with_fallback(
     """Stream from the first provider; if it fails before producing output with a quota,
     overload or timeout error, move on to the next. On the free tier each Gemini model
     has its own daily quota, so this keeps chat working when one model runs out."""
+    providers = available(providers)
     for i, provider in enumerate(providers):
         produced = False
         try:
@@ -285,6 +320,13 @@ async def stream_with_fallback(
             usage.model = provider.model
             return
         except ProviderError as exc:
+            if exc.retry_after_s is not None:
+                mark_exhausted(provider.model, exc.retry_after_s)
+                logger.warning(
+                    "%s daily quota used up; skipping it for %.0f min",
+                    provider.model,
+                    min(exc.retry_after_s, MAX_SKIP_SECONDS) / 60,
+                )
             if produced or not exc.fallback or i == len(providers) - 1:
                 raise
             logger.warning(

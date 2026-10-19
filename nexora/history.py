@@ -148,6 +148,7 @@ class NexoraDataLayer(ChainlitDataLayer):
                     timeout=10,
                 )
                 async with pool.acquire() as conn, conn.transaction():
+                    await conn.execute("SET LOCAL lock_timeout = '15s'")
                     await conn.execute("SELECT pg_advisory_xact_lock(727275)")
                     await conn.execute(SCHEMA)
             except _CONNECTION_ERRORS as exc:

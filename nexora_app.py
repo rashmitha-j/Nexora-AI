@@ -115,6 +115,7 @@ PUBLIC_MAX_CHUNKS = 300  # roughly 300 KB of text, to protect the free embedding
 PUBLIC_DOC_TTL_HOURS = 24
 PURGE_INTERVAL_SECONDS = 3600
 INGEST_TIMEOUT_SECONDS = 90
+STORAGE_TIMEOUT_SECONDS = 45
 _last_purge = 0.0
 
 
@@ -158,13 +159,16 @@ async def purge_stale_session_docs() -> None:
 async def rag_ready() -> bool:
     """Make sure document tables exist; tell the user if the database is unreachable."""
     try:
-        await ensure_rag_schema()
-        await purge_stale_session_docs()
-        return True
+        async with asyncio.timeout(STORAGE_TIMEOUT_SECONDS):
+            await ensure_rag_schema()
     except Exception:
         logger.exception("Document storage unavailable")
         await say("Document storage is unavailable right now (the database didn't respond). Chat still works.")
         return False
+    # Housekeeping never delays the user's request.
+    if time.monotonic() - _last_purge >= PURGE_INTERVAL_SECONDS:
+        asyncio.create_task(purge_stale_session_docs())
+    return True
 
 
 async def has_documents() -> bool:
@@ -302,6 +306,11 @@ async def on_message(message: cl.Message):
 
 
 async def handle_message(message: cl.Message) -> None:
+    logger.info(
+        "message received: %d chars, %d attachments",
+        len(message.content or ""),
+        len(message.elements or []),
+    )
     wait = limiter.check(rate_limit_key())
     if wait:
         await say(f"You're sending messages too quickly. Try again in {int(wait) + 1} seconds.")
@@ -403,10 +412,18 @@ async def handle_uploads(files) -> None:
     if rag is None:
         await say("Document upload isn't enabled on this server (DATABASE_URL is not set).")
         return
+    logger.info("upload: preparing storage for %d file(s)", len(files))
     if not await rag_ready():
         return
     anonymous = is_anonymous()
-    existing = len(await rag.store.list_documents(owner)) if anonymous else 0
+    try:
+        async with asyncio.timeout(STORAGE_TIMEOUT_SECONDS):
+            existing = len(await rag.store.list_documents(owner)) if anonymous else 0
+    except Exception:
+        logger.exception("Listing documents failed")
+        await say("Document storage is unavailable right now (the database didn't respond). Chat still works.")
+        return
+    logger.info("upload: storage ready, %d existing document(s)", existing)
     for element in files:
         path = Path(element.path)
         size_mb = path.stat().st_size / (1024 * 1024)

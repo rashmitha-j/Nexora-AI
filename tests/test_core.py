@@ -171,6 +171,15 @@ async def collect(provider, timeout=5):
 
 
 @pytest.fixture(autouse=True)
+def fresh_quota_memory():
+    from nexora import providers as prov
+
+    prov._exhausted_until.clear()
+    yield
+    prov._exhausted_until.clear()
+
+
+@pytest.fixture(autouse=True)
 def fast_sleep(monkeypatch):
     async def no_sleep(_):
         return None
@@ -311,3 +320,29 @@ def test_candidate_models(env):
     assert candidate_models(s, "gemini", "my-model") == ["my-model"]
     env.setenv("GEMINI_FALLBACK_MODELS", "")
     assert candidate_models(config_mod.load_settings(), "gemini", None) == ["gemini-3.5-flash"]
+
+
+class DailyQuotaWithDelay(DailyQuota):
+    def __str__(self):
+        return super().__str__() + ' "retryDelay": "64138s"'
+
+
+def test_exhausted_model_is_skipped_until_reset():
+    from nexora import providers as prov
+
+    prov._exhausted_until.clear()
+    first = NamedFake("gemini-a", [[DailyQuotaWithDelay()], ["should not be called again"]])
+    second = NamedFake("gemini-b", [["one"], ["two"]])
+
+    async def ask():
+        usage = Usage()
+        out = [c async for c in prov.stream_with_fallback([first, second], "s", [], usage, 5)]
+        return "".join(out), usage.model
+
+    assert asyncio.run(ask()) == ("one", "gemini-b")
+    assert asyncio.run(ask()) == ("two", "gemini-b")
+    assert first.calls == 1  # skipped on the second message
+    assert classify(DailyQuotaWithDelay(), "gemini").retry_after_s == 64138.0
+    # When every model is exhausted, the last one is still tried so the user gets an answer.
+    assert [p.model for p in prov.available([first])] == ["gemini-a"]
+    prov._exhausted_until.clear()

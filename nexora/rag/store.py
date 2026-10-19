@@ -128,12 +128,22 @@ class PgVectorStore:
     async def ensure_schema(self) -> None:
         import asyncpg
 
+        wanted = len(migrations(self._dim))
         # The vector type must exist before pooled connections register its codec.
-        conn = await asyncpg.connect(self._url, statement_cache_size=0, timeout=10)
+        conn = await asyncpg.connect(self._url, statement_cache_size=0, timeout=10, command_timeout=30)
         try:
+            # Fast path: already migrated, so no DDL and no lock. This is every start except the first.
+            exists = await conn.fetchval("SELECT to_regclass('nexora_schema_migrations') IS NOT NULL")
+            if (
+                exists
+                and await conn.fetchval("SELECT coalesce(max(version), 0) FROM nexora_schema_migrations") >= wanted
+            ):
+                return
             async with conn.transaction():
+                # Never wait forever on a lock another (possibly dead) instance holds.
+                await conn.execute("SET LOCAL lock_timeout = '15s'")
                 await conn.execute("CREATE TABLE IF NOT EXISTS nexora_schema_migrations (version integer PRIMARY KEY)")
-                # Serialise concurrent startups.
+                # Serialise concurrent first-time setups.
                 await conn.execute("SELECT pg_advisory_xact_lock(727274)")
                 applied = await conn.fetchval("SELECT coalesce(max(version), 0) FROM nexora_schema_migrations")
                 for version, sql in enumerate(migrations(self._dim), start=1):
