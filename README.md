@@ -80,7 +80,9 @@ Then set `METAGPT_WORKER_URL=http://127.0.0.1:8001` and the same `METAGPT_WORKER
 Notes on running upstream MetaGPT:
 - `worker/requirements.txt` is upstream MetaGPT's dependency list at a pinned commit, with two changes. `lancedb==0.4.0` is removed because it's no longer on PyPI. `pyarrow` is added because `qianfan` otherwise injects a fake `pyarrow` that breaks pandas.
 - With `METAGPT_API_TYPE=gemini` (the default) the worker talks to Gemini through Google's OpenAI-compatible endpoint. MetaGPT's native Gemini client drops all system prompts, so its first step fails.
-- Each job runs in its own process with a per-job home directory and a fixed git identity, and is killed at `METAGPT_JOB_TIMEOUT_SECONDS`.
+- Each job runs in its own process, starting inside its own workspace folder, with a per-job home directory and a fixed git identity, and is killed at `METAGPT_JOB_TIMEOUT_SECONDS`. The project path is never taken from the user's idea, so generated files stay in the job's workspace.
+- MetaGPT 1.0's "quick think" shortcut is disabled for the hired roles; otherwise small ideas get a chat answer instead of running the pipeline.
+- A full run makes dozens of LLM calls. On Gemini's free tier that can use a large share of a model's daily quota, so point the worker at a different model (or key) than the public chat if you can.
 
 ## Commands in the chat
 
@@ -100,12 +102,12 @@ See [.env.example](.env.example) for the full list with defaults.
 | Variable | Used by | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL` | web | Chat providers (at least one) |
-| `NEXORA_PROVIDER`, `*_MODEL` | web | Default provider and models |
+| `NEXORA_PROVIDER`, `*_MODEL`, `*_FALLBACK_MODELS` | web | Default provider, models, and models to fall back to on quota/overload errors |
 | `LLM_TIMEOUT_SECONDS`, `MAX_OUTPUT_TOKENS`, `RATE_LIMIT_PER_MINUTE`, `MAX_MESSAGE_CHARS`, `HISTORY_TURNS` | web | Limits |
 | `NEXORA_USERS`, `CHAINLIT_AUTH_SECRET` | web | Sign-in |
 | `DATABASE_URL`, `EMBEDDING_*`, `RAG_TOP_K`, `RAG_MIN_SCORE`, `MAX_UPLOAD_MB` | web | Documents |
 | `METAGPT_WORKER_URL`, `METAGPT_WORKER_TOKEN` | web + worker | Worker connection |
-| `METAGPT_API_TYPE`, `METAGPT_MODEL`, `METAGPT_API_KEY`, `METAGPT_JOB_TIMEOUT_SECONDS`, `WORKER_JOBS_DIR` | worker | MetaGPT runs |
+| `METAGPT_API_TYPE`, `METAGPT_MODEL`, `METAGPT_API_KEY`, `METAGPT_JOB_TIMEOUT_SECONDS`, `METAGPT_MAX_TOKENS`, `WORKER_JOBS_DIR` | worker | MetaGPT runs |
 
 ## Tests and checks
 
@@ -135,7 +137,7 @@ The live service is a Render **free web service** with:
 ## Known limitations (free tier)
 
 - **Cold starts.** Render's free web services sleep after 15 minutes without traffic; the first visit afterwards takes about a minute.
-- **Gemini quotas.** The free Gemini tier limits requests per minute and per day. When a limit is hit, users see a "rate limit or quota reached" message. `gemini-3.8-flash` was often overloaded (HTTP 503) during testing, so the default is `gemini-3.5-flash`. `gemini-2.5-flash` no longer works for new API keys.
+- **Gemini quotas.** The free Gemini tier limits requests per minute and per day, **per model**. When the main model (`gemini-3.5-flash`) hits its quota or is overloaded, Nexora automatically retries with `GEMINI_FALLBACK_MODELS` (default `gemini-3.7-flash`, then `gemini-3.1-flash-lite`). Only when all of them are exhausted do users see a "rate limit or quota reached" message. `gemini-2.5-flash` no longer works for new API keys.
 - **Neon free plan.** Storage is limited (0.5 GB at the time of writing) and the database suspends when idle, so the first query after a pause is slower. Pool sizes are kept small (history 5, documents 3 connections).
 - **Single instance.** Rate limits and the job queue live in memory, so run one instance. With more instances, move them to Redis.
 - **MetaGPT** needs more than the free plan's 512 MB of RAM, so `/build` is only available when you run the worker yourself.

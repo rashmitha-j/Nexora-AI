@@ -32,15 +32,18 @@ class ChatMessage:
 class Usage:
     input_tokens: int | None = None
     output_tokens: int | None = None
+    model: str | None = None  # the model that actually answered (after any fallback)
 
 
 class ProviderError(RuntimeError):
-    """A provider call failed. `user_message` is safe to show; `retryable` drives retries."""
+    """A provider call failed. `user_message` is safe to show. `retryable`: worth retrying the
+    same model. `fallback`: worth trying another model (quota, overload, timeouts)."""
 
-    def __init__(self, user_message: str, retryable: bool = False):
+    def __init__(self, user_message: str, retryable: bool = False, fallback: bool | None = None):
         super().__init__(user_message)
         self.user_message = user_message
         self.retryable = retryable
+        self.fallback = retryable if fallback is None else fallback
 
 
 class ChatProvider(Protocol):
@@ -74,7 +77,13 @@ def classify(exc: BaseException, provider: str) -> ProviderError:
     if status == 404:
         return ProviderError(f"{provider} doesn't recognise the configured model name.")
     if status == 429:
-        return ProviderError(f"{provider} rate limit or quota reached. Wait a moment and try again.", retryable=True)
+        # A daily quota won't recover in seconds; skip retries and go straight to a fallback model.
+        daily = "PerDay" in str(exc)
+        return ProviderError(
+            f"{provider} rate limit or quota reached. Wait a moment and try again.",
+            retryable=not daily,
+            fallback=True,
+        )
     if status is not None and status >= 500:
         return ProviderError(f"{provider} had a server error. Please try again.", retryable=True)
     if status == 400:
@@ -90,7 +99,11 @@ class GeminiProvider:
         from google.genai import types
 
         self._types = types
-        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_s * 1000))
+        # Retries happen in stream_reply; the SDK's own 5 attempts would multiply them.
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=timeout_s * 1000, retry_options=types.HttpRetryOptions(attempts=1)),
+        )
         self.model = model
         self._max_output_tokens = max_output_tokens
 
@@ -242,3 +255,42 @@ async def stream_reply(
             if produced or not error.retryable or attempt == max_attempts:
                 raise error from exc
             await asyncio.sleep(2 ** (attempt - 1))
+
+
+def candidate_models(settings: Settings, name: str, override: str | None) -> list[str]:
+    """The model to try first, then the provider's fallbacks. A model the user picked
+    explicitly is used on its own."""
+    if override and override.strip():
+        return [override.strip()]
+    primary = settings.models[name]
+    return [primary] + [m for m in settings.fallback_models.get(name, []) if m != primary]
+
+
+async def stream_with_fallback(
+    providers: list[ChatProvider],
+    system: str,
+    messages: list[ChatMessage],
+    usage: Usage,
+    timeout_s: int,
+) -> AsyncIterator[str]:
+    """Stream from the first provider; if it fails before producing output with a quota,
+    overload or timeout error, move on to the next. On the free tier each Gemini model
+    has its own daily quota, so this keeps chat working when one model runs out."""
+    for i, provider in enumerate(providers):
+        produced = False
+        try:
+            async for chunk in stream_reply(provider, system, messages, usage, timeout_s):
+                produced = True
+                yield chunk
+            usage.model = provider.model
+            return
+        except ProviderError as exc:
+            if produced or not exc.fallback or i == len(providers) - 1:
+                raise
+            logger.warning(
+                "%s/%s unavailable (%s); falling back to %s",
+                provider.name,
+                provider.model,
+                exc.user_message,
+                providers[i + 1].model,
+            )

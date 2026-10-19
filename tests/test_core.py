@@ -24,6 +24,7 @@ ENV_KEYS = [
     "CHAINLIT_AUTH_SECRET",
     "RATE_LIMIT_PER_MINUTE",
     "GEMINI_MODEL",
+    "GEMINI_FALLBACK_MODELS",
 ]
 
 
@@ -246,3 +247,67 @@ def test_help_text_hides_unavailable_features():
     minimal = help_text(docs=False, build=False)
     assert "/docs" not in minimal and "/forget" not in minimal and "/build" not in minimal
     assert "/help" in minimal and "/usage" in minimal
+
+
+# -- model fallback ----------------------------------------------------------
+
+
+class NamedFake(FakeProvider):
+    def __init__(self, model, script):
+        super().__init__(script)
+        self.model = model
+
+
+class DailyQuota(Exception):
+    status_code = 429
+
+    def __str__(self):
+        return "429 RESOURCE_EXHAUSTED quotaId GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+
+
+def test_daily_quota_is_not_retried_but_falls_back():
+    err = classify(DailyQuota(), "gemini")
+    assert err.retryable is False and err.fallback is True
+    assert classify(Status(429), "gemini").retryable is True
+    assert classify(Status(401), "gemini").fallback is False
+
+
+def test_stream_with_fallback_moves_to_next_model():
+    from nexora.providers import stream_with_fallback
+
+    first = NamedFake("gemini-a", [[DailyQuota()]])
+    second = NamedFake("gemini-b", [["hi"]])
+
+    async def run():
+        usage = Usage()
+        out = [c async for c in stream_with_fallback([first, second], "s", [], usage, 5)]
+        return "".join(out), usage
+
+    text, usage = asyncio.run(run())
+    assert text == "hi" and usage.model == "gemini-b" and first.calls == 1
+
+
+def test_stream_with_fallback_does_not_hide_auth_errors():
+    from nexora.providers import stream_with_fallback
+
+    first = NamedFake("gemini-a", [[Status(401)]])
+    second = NamedFake("gemini-b", [["never"]])
+
+    async def run():
+        async for _ in stream_with_fallback([first, second], "s", [], Usage(), 5):
+            pass
+
+    with pytest.raises(ProviderError, match="API key"):
+        asyncio.run(run())
+    assert second.calls == 0
+
+
+def test_candidate_models(env):
+    from nexora.providers import candidate_models
+
+    env.setenv("GEMINI_API_KEY", "k")
+    s = config_mod.load_settings()
+    assert candidate_models(s, "gemini", "") == ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
+    assert candidate_models(s, "gemini", "my-model") == ["my-model"]
+    env.setenv("GEMINI_FALLBACK_MODELS", "")
+    assert candidate_models(config_mod.load_settings(), "gemini", None) == ["gemini-3.5-flash"]

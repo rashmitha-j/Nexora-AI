@@ -12,6 +12,8 @@ DEFAULT_MODELS = {
     "ollama": "llama3.1",
 }
 
+DEFAULT_FALLBACKS = {"gemini": "gemini-3.7-flash,gemini-3.1-flash-lite"}
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing or has invalid settings."""
@@ -50,6 +52,7 @@ class Settings:
     default_provider: str
     api_keys: dict[str, str]
     models: dict[str, str]
+    fallback_models: dict[str, list[str]]
     ollama_base_url: str
     llm_timeout_s: int
     max_output_tokens: int
@@ -104,6 +107,14 @@ def load_settings() -> Settings:
         "openai": _str("OPENAI_MODEL", DEFAULT_MODELS["openai"]),
         "ollama": _str("OLLAMA_MODEL", DEFAULT_MODELS["ollama"]),
     }
+    # Tried in order when the main model hits a quota or is overloaded. Each Gemini model has
+    # its own free-tier daily quota, so falling back keeps chat available.
+    fallback_models = {}
+    for p in DEFAULT_MODELS:
+        # Set but empty means "no fallbacks", so read the raw value rather than via _str.
+        raw = os.getenv(f"{p.upper()}_FALLBACK_MODELS")
+        raw = DEFAULT_FALLBACKS.get(p, "") if raw is None else raw
+        fallback_models[p] = [m.strip() for m in raw.split(",") if m.strip()]
     embedding_provider = _str("EMBEDDING_PROVIDER", "gemini").lower()
     if embedding_provider not in ("gemini", "openai"):
         raise ConfigError("EMBEDDING_PROVIDER must be 'gemini' or 'openai'")
@@ -113,6 +124,7 @@ def load_settings() -> Settings:
         default_provider=_str("NEXORA_PROVIDER", "gemini").lower(),
         api_keys=api_keys,
         models=models,
+        fallback_models=fallback_models,
         ollama_base_url=_str("OLLAMA_BASE_URL").rstrip("/"),
         llm_timeout_s=_int("LLM_TIMEOUT_SECONDS", 60),
         max_output_tokens=_int("MAX_OUTPUT_TOKENS", 2048),

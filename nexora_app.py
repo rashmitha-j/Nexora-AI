@@ -18,7 +18,7 @@ from nexora.config import load_settings
 from nexora.jobs import JobClient, JobClientError
 from nexora.limits import RateLimiter
 from nexora.prompts import BASE_SYSTEM, rag_system
-from nexora.providers import ChatMessage, ProviderError, Usage, build_provider, stream_reply
+from nexora.providers import ChatMessage, ProviderError, Usage, build_provider, candidate_models, stream_with_fallback
 from nexora.rag.ingest import UnsupportedFileError
 from nexora.rag.service import RagService, format_context, format_sources
 
@@ -241,10 +241,14 @@ async def handle_message(message: cl.Message) -> None:
 async def chat(text: str) -> None:
     provider_name = cl.user_session.get("provider")
     try:
-        provider = build_provider(settings, provider_name, cl.user_session.get("model"))
+        providers = [
+            build_provider(settings, provider_name, model)
+            for model in candidate_models(settings, provider_name, cl.user_session.get("model"))
+        ]
     except ProviderError as exc:
         await say(exc.user_message)
         return
+    provider = providers[0]
 
     history: list[ChatMessage] = cl.user_session.get("history")
     system, hits = BASE_SYSTEM, []
@@ -264,10 +268,12 @@ async def chat(text: str) -> None:
     reply = cl.Message(content="")
     started = time.monotonic()
     try:
-        async for chunk in stream_reply(provider, system, messages, usage, settings.llm_timeout_s):
+        async for chunk in stream_with_fallback(providers, system, messages, usage, settings.llm_timeout_s):
             await reply.stream_token(chunk)
     except ProviderError as exc:
-        logger.error("Chat failed for provider=%s model=%s", provider.name, provider.model, exc_info=exc.__cause__)
+        logger.error(
+            "Chat failed for provider=%s models=%s", provider.name, [p.model for p in providers], exc_info=exc.__cause__
+        )
         if reply.content:
             await reply.stream_token(f"\n\n_Response interrupted: {exc.user_message}_")
             await reply.send()
@@ -291,7 +297,7 @@ async def chat(text: str) -> None:
     logger.info(
         "chat provider=%s model=%s in=%s out=%s sources=%d seconds=%.1f",
         provider.name,
-        provider.model,
+        usage.model,
         usage.input_tokens,
         usage.output_tokens,
         len(hits),
