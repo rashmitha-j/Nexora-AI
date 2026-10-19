@@ -22,6 +22,14 @@ class DocumentTooLargeError(ValueError):
     pass
 
 
+class EmbeddingError(RuntimeError):
+    """The embedding provider failed; __cause__ holds the provider's exception."""
+
+
+class StorageError(RuntimeError):
+    """Saving to the database failed; __cause__ holds the database exception."""
+
+
 @dataclass
 class IngestResult:
     filename: str
@@ -52,12 +60,18 @@ class RagService:
                 f"{filename} is too large to index here ({len(chunks)} sections; the limit is {max_chunks})."
             )
         t2 = time.monotonic()
-        embeddings = await self.embedder.embed_documents([c.text for c in chunks])
+        try:
+            embeddings = await self.embedder.embed_documents([c.text for c in chunks])
+        except Exception as exc:
+            raise EmbeddingError(str(exc)) from exc
         t3 = time.monotonic()
-        # Re-uploading the same file re-indexes it instead of duplicating it.
-        if existing:
-            await self.store.delete_document(owner, existing.id)
-        doc_id = await self.store.add_document(owner, filename, sha256, self.embedder.model, chunks, embeddings)
+        try:
+            # Re-uploading the same file re-indexes it instead of duplicating it.
+            if existing:
+                await self.store.delete_document(owner, existing.id)
+            doc_id = await self.store.add_document(owner, filename, sha256, self.embedder.model, chunks, embeddings)
+        except Exception as exc:
+            raise StorageError(str(exc)) from exc
         logger.info(
             "ingest %s: %d chunks; lookup %.1fs, extract %.1fs, embed %.1fs, store %.1fs",
             filename,

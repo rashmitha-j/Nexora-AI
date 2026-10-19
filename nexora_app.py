@@ -33,7 +33,9 @@ from nexora.rag.ingest import UnsupportedFileError
 from nexora.rag.service import (
     MAX_CHUNKS_PER_DOCUMENT,
     DocumentTooLargeError,
+    EmbeddingError,
     RagService,
+    StorageError,
     format_context,
     format_sources,
 )
@@ -481,9 +483,14 @@ async def handle_uploads(files) -> None:
             except Exception as exc:
                 logger.exception("Ingest failed for %s after %.1fs", element.name, time.monotonic() - started)
                 step.output = "Failed"
-                reason = classify(exc, "The embedding service").user_message
                 if isinstance(exc, TimeoutError):
                     reason = f"Indexing took longer than {INGEST_TIMEOUT_SECONDS} seconds."
+                elif isinstance(exc, EmbeddingError):
+                    reason = classify(exc.__cause__ or exc, "The embedding service").user_message
+                elif isinstance(exc, StorageError):
+                    reason = "the database couldn't save it. Please try again in a moment."
+                else:
+                    reason = "an unexpected error occurred while reading it."
                 await say(f"Couldn't index **{element.name}**: {reason}")
                 continue
             logger.info("Indexed %s in %.1fs", element.name, time.monotonic() - started)

@@ -170,3 +170,36 @@ def test_ingest_rejects_documents_over_the_chunk_limit(tmp_path):
     with pytest.raises(DocumentTooLargeError, match="limit is 2"):
         asyncio.run(service.ingest("alice", "big.txt", big, max_chunks=2))
     assert asyncio.run(service.store.list_documents("alice")) == []
+
+
+def test_extraction_removes_control_characters(tmp_path):
+    from nexora.rag.ingest import clean_text
+
+    assert clean_text("Certi\x00ficate\x07 of\tParticipation\n") == "Certificate of\tParticipation\n"
+    f = make_file(tmp_path, "cert.txt", "Name:\x00 Jayanth")
+    assert extract_sections(f, "cert.txt")[0].text == "Name: Jayanth"
+
+
+def test_damaged_pdf_is_reported_as_unreadable(tmp_path):
+    bad = tmp_path / "broken.pdf"
+    bad.write_bytes(b"%PDF-1.4 this is not really a pdf")
+    with pytest.raises(UnsupportedFileError, match="couldn't read this PDF"):
+        extract_sections(bad, "broken.pdf")
+
+
+def test_ingest_errors_name_the_failing_stage(tmp_path):
+    from nexora.rag.service import EmbeddingError, StorageError
+
+    class BrokenEmbedder(FakeEmbedder):
+        async def embed_documents(self, texts):
+            raise RuntimeError("quota")
+
+    class BrokenStore(FakeStore):
+        async def add_document(self, *args):
+            raise RuntimeError("db down")
+
+    f = make_file(tmp_path, "a.txt", "apple")
+    with pytest.raises(EmbeddingError):
+        asyncio.run(RagService(FakeStore(), BrokenEmbedder(), top_k=1).ingest("u", "a.txt", f))
+    with pytest.raises(StorageError):
+        asyncio.run(RagService(BrokenStore(), FakeEmbedder(), top_k=1).ingest("u", "a.txt", f))
