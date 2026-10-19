@@ -1,3 +1,5 @@
+# Render Blueprint: the Chainlit web app plus the MetaGPT worker.
+# Secrets marked `sync: false` are entered in the Render dashboard; never commit them.
 services:
   - type: web
     name: nexora-ai
@@ -5,11 +7,55 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: chainlit run nexora_app.py --host 0.0.0.0 --port $PORT --headless
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: NEXORA_PROVIDER
+        value: gemini
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
-      # Set the real key in the Render dashboard; never commit it.
+        value: gemini-3.8-flash
       - key: GEMINI_API_KEY
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Postgres with pgvector (e.g. Neon or Supabase). Leave empty to disable documents.
+      - key: DATABASE_URL
+        sync: false
+      # Sign-in: "user:<hash>" pairs from `python -m nexora.auth`, comma separated.
+      - key: NEXORA_USERS
+        sync: false
+      - key: CHAINLIT_AUTH_SECRET
+        generateValue: true
+      # Public URL of the worker service below, e.g. https://nexora-metagpt-worker.onrender.com
+      - key: METAGPT_WORKER_URL
+        sync: false
+      - key: METAGPT_WORKER_TOKEN
+        fromService:
+          type: web
+          name: nexora-metagpt-worker
+          envVarKey: METAGPT_WORKER_TOKEN
+
+  - type: web
+    name: nexora-metagpt-worker
+    runtime: python
+    # MetaGPT needs a lot of memory; the free plan's 512 MB may not be enough.
+    plan: free
+    buildCommand: PYTHON=python sh worker/install.sh
+    startCommand: uvicorn worker.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: METAGPT_WORKER_TOKEN
+        generateValue: true
+      - key: METAGPT_API_TYPE
+        value: gemini
+      - key: METAGPT_MODEL
+        value: gemini-3.8-flash
+      - key: METAGPT_API_KEY
+        sync: false
+      - key: METAGPT_JOB_TIMEOUT_SECONDS
+        value: "900"
