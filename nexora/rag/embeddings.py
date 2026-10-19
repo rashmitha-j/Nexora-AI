@@ -4,9 +4,13 @@ where the provider supports it, which improves retrieval quality."""
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from typing import Protocol
 
 from nexora.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class Embedder(Protocol):
@@ -26,7 +30,14 @@ class GeminiEmbedder:
         from google.genai import types
 
         self._types = types
-        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_s * 1000))
+        # One attempt per call: the SDK's default 5 retries with backoff could keep an upload
+        # waiting for minutes with no feedback. Callers decide whether to retry.
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=min(timeout_s, 30) * 1000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
         self.model = model
         self.dim = dim
 
@@ -34,8 +45,15 @@ class GeminiEmbedder:
         vectors: list[list[float]] = []
         config = self._types.EmbedContentConfig(task_type=task_type, output_dimensionality=self.dim)
         for i in range(0, len(texts), self.batch_size):
+            started = time.monotonic()
             result = await self._client.aio.models.embed_content(
                 model=self.model, contents=texts[i : i + self.batch_size], config=config
+            )
+            logger.info(
+                "embedded %d texts with %s in %.1fs",
+                len(texts[i : i + self.batch_size]),
+                self.model,
+                time.monotonic() - started,
             )
             vectors.extend(list(e.values) for e in result.embeddings)
         return vectors

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from nexora.rag.embeddings import Embedder
 from nexora.rag.ingest import chunk_sections, extract_sections
 from nexora.rag.store import DocumentStore, Hit
+
+logger = logging.getLogger(__name__)
 
 MAX_CHUNKS_PER_DOCUMENT = 2000
 
@@ -38,18 +42,31 @@ class RagService:
     async def ingest(
         self, owner: str, filename: str, path: Path, max_chunks: int = MAX_CHUNKS_PER_DOCUMENT
     ) -> IngestResult:
+        t0 = time.monotonic()
         sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         existing = await self.store.find_by_hash(owner, sha256)
+        t1 = time.monotonic()
         chunks = chunk_sections(extract_sections(path, filename))
         if len(chunks) > max_chunks:
             raise DocumentTooLargeError(
                 f"{filename} is too large to index here ({len(chunks)} sections; the limit is {max_chunks})."
             )
+        t2 = time.monotonic()
         embeddings = await self.embedder.embed_documents([c.text for c in chunks])
+        t3 = time.monotonic()
         # Re-uploading the same file re-indexes it instead of duplicating it.
         if existing:
             await self.store.delete_document(owner, existing.id)
         doc_id = await self.store.add_document(owner, filename, sha256, self.embedder.model, chunks, embeddings)
+        logger.info(
+            "ingest %s: %d chunks; lookup %.1fs, extract %.1fs, embed %.1fs, store %.1fs",
+            filename,
+            len(chunks),
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            time.monotonic() - t3,
+        )
         return IngestResult(filename, doc_id, len(chunks), replaced=existing is not None)
 
     async def reindex(self, owner: str) -> int:

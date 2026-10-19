@@ -120,6 +120,7 @@ class PgVectorStore:
                     max_size=self._max,
                     statement_cache_size=0,
                     command_timeout=30,
+                    timeout=10,
                     init=register_vector,
                 )
         return self._pool

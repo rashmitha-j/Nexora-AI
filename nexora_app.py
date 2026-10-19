@@ -18,7 +18,15 @@ from nexora.config import load_settings
 from nexora.jobs import JobClient, JobClientError
 from nexora.limits import RateLimiter
 from nexora.prompts import BASE_SYSTEM, rag_system
-from nexora.providers import ChatMessage, ProviderError, Usage, build_provider, candidate_models, stream_with_fallback
+from nexora.providers import (
+    ChatMessage,
+    ProviderError,
+    Usage,
+    build_provider,
+    candidate_models,
+    classify,
+    stream_with_fallback,
+)
 from nexora.rag.ingest import UnsupportedFileError
 from nexora.rag.service import (
     MAX_CHUNKS_PER_DOCUMENT,
@@ -106,6 +114,7 @@ PUBLIC_MAX_DOCS = 5
 PUBLIC_MAX_CHUNKS = 300  # roughly 300 KB of text, to protect the free embedding quota
 PUBLIC_DOC_TTL_HOURS = 24
 PURGE_INTERVAL_SECONDS = 3600
+INGEST_TIMEOUT_SECONDS = 90
 _last_purge = 0.0
 
 
@@ -408,18 +417,24 @@ async def handle_uploads(files) -> None:
             await say(f"This chat already has {PUBLIC_MAX_DOCS} documents. Remove one with `/forget <n>` first.")
             break
         async with cl.Step(name=f"Indexing {element.name}") as step:
+            started = time.monotonic()
             try:
                 limit = PUBLIC_MAX_CHUNKS if anonymous else MAX_CHUNKS_PER_DOCUMENT
-                result = await rag.ingest(owner, element.name, path, max_chunks=limit)
+                async with asyncio.timeout(INGEST_TIMEOUT_SECONDS):
+                    result = await rag.ingest(owner, element.name, path, max_chunks=limit)
             except (UnsupportedFileError, DocumentTooLargeError) as exc:
                 step.output = str(exc)
                 await say(str(exc))
                 continue
-            except Exception:
-                logger.exception("Ingest failed for %s", element.name)
+            except Exception as exc:
+                logger.exception("Ingest failed for %s after %.1fs", element.name, time.monotonic() - started)
                 step.output = "Failed"
-                await say(f"Couldn't index **{element.name}**. Please try again.")
+                reason = classify(exc, "The embedding service").user_message
+                if isinstance(exc, TimeoutError):
+                    reason = f"Indexing took longer than {INGEST_TIMEOUT_SECONDS} seconds."
+                await say(f"Couldn't index **{element.name}**: {reason}")
                 continue
+            logger.info("Indexed %s in %.1fs", element.name, time.monotonic() - started)
             verb = "Re-indexed" if result.replaced else "Indexed"
             step.output = f"{verb} {result.chunk_count} chunks"
         if not result.replaced:
