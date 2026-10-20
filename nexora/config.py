@@ -60,6 +60,7 @@ class Settings:
     max_output_tokens: int
     # Request limits
     rate_limit_per_minute: int
+    global_rate_limit_per_minute: int
     max_message_chars: int
     history_turns: int
     # RAG
@@ -131,6 +132,7 @@ def load_settings() -> Settings:
         llm_timeout_s=_int("LLM_TIMEOUT_SECONDS", 60),
         max_output_tokens=_int("MAX_OUTPUT_TOKENS", 2048),
         rate_limit_per_minute=_int("RATE_LIMIT_PER_MINUTE", 10),
+        global_rate_limit_per_minute=_int("GLOBAL_RATE_LIMIT_PER_MINUTE", 30),
         max_message_chars=_int("MAX_MESSAGE_CHARS", 8000),
         history_turns=_int("HISTORY_TURNS", 10),
         database_url=_str("DATABASE_URL"),

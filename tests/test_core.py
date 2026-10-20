@@ -312,14 +312,20 @@ def test_stream_with_fallback_does_not_hide_auth_errors():
 
 
 def test_candidate_models(env):
-    from nexora.providers import candidate_models
+    from nexora.providers import allowed_models, candidate_models
 
     env.setenv("GEMINI_API_KEY", "k")
     s = config_mod.load_settings()
-    assert candidate_models(s, "gemini", "") == [
+    chain = [
         "gemini-3.5-flash"
     ] + "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite".split(",")
-    assert candidate_models(s, "gemini", "my-model") == ["my-model"]
+    assert allowed_models(s, "gemini") == chain
+    assert candidate_models(s, "gemini", "") == chain
+    # An allowed choice goes first and keeps the others as fallbacks.
+    assert candidate_models(s, "gemini", "gemini-3.7-flash")[0] == "gemini-3.7-flash"
+    assert sorted(candidate_models(s, "gemini", "gemini-3.7-flash")) == sorted(chain)
+    # Anything else a client sends (e.g. a costlier model) is ignored.
+    assert candidate_models(s, "gemini", "gemini-3.1-pro-preview") == chain
     env.setenv("GEMINI_FALLBACK_MODELS", "")
     assert candidate_models(config_mod.load_settings(), "gemini", None) == ["gemini-3.5-flash"]
 
@@ -327,6 +333,13 @@ def test_candidate_models(env):
 class DailyQuotaWithDelay(DailyQuota):
     def __str__(self):
         return super().__str__() + ' "retryDelay": "64138s"'
+
+
+def test_global_rate_limit_setting(env):
+    env.setenv("GEMINI_API_KEY", "k")
+    assert config_mod.load_settings().global_rate_limit_per_minute == 30
+    env.setenv("GLOBAL_RATE_LIMIT_PER_MINUTE", "5")
+    assert config_mod.load_settings().global_rate_limit_per_minute == 5
 
 
 def test_exhausted_model_is_skipped_until_reset():

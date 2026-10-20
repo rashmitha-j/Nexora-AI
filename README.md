@@ -1,159 +1,347 @@
-# Nexora AI
+# Nexora-AI
 
-Nexora AI is a Chainlit chat app with:
+[![CI](https://github.com/rashmitha-j/Nexora-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/rashmitha-j/Nexora-AI/actions/workflows/ci.yml)
+![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![Chainlit](https://img.shields.io/badge/Chainlit-2.12-F80061)
+![Google Gemini](https://img.shields.io/badge/Google-Gemini-4285F4?logo=googlegemini&logoColor=white)
+![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
+![Render](https://img.shields.io/badge/Deployed%20on-Render-46E3B7?logo=render&logoColor=black)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- **Multi-provider chat.** Google Gemini, Anthropic Claude, OpenAI, or a local Ollama model, streamed token by token, with per-user rate limits, timeouts, retries and token-usage tracking.
-- **Answers from your documents (RAG).** Upload PDF, text, Markdown, CSV or JSON files. They're chunked, embedded and stored in Postgres with pgvector. Answers cite the passages they used, and each user only ever retrieves their own documents.
-- **Chat history.** Signed-in users' conversations are saved in the same Postgres database and listed in the sidebar; reopening one restores its context.
-- **MetaGPT build jobs (optional, runs locally).** `/build <idea>` runs a MetaGPT software team (product manager → architect → project manager → engineer) in a separate worker service and returns the generated project as a zip. The worker needs more memory than Render's free plan, so it isn't part of the free deployment.
+Nexora-AI is a generative-AI assistant built with Chainlit and Google Gemini. It chats with streaming answers, answers questions about uploaded PDF, text and Markdown files with cited sources (retrieval-augmented generation on PostgreSQL + pgvector), and can hand software-building tasks to a MetaGPT multi-agent team running as a separate worker. It is designed to run on free tiers: Render, Neon and the Gemini free quota.
+
+- **Live app:** https://nexora-ai-jcdz.onrender.com
+- **Repository:** https://github.com/rashmitha-j/Nexora-AI
+
+> The live app runs on Render's free plan, which sleeps after 15 minutes without traffic. The first visit after that can take about a minute to load.
+
+## Screenshots
+
+| Answering from an uploaded document, with its source | Welcome screen |
+|---|---|
+| ![Document question answered with a citation](docs/screenshots/02-document-qa.jpg) | ![Welcome screen](docs/screenshots/01-welcome.jpg) |
+| **Model choice limited to server-approved models** | **Mobile layout** |
+| ![Settings panel with the model dropdown](docs/screenshots/03-model-settings.jpg) | <img src="docs/screenshots/04-mobile.jpg" alt="Mobile layout" width="260"> |
+
+Screenshots were taken from this code running locally, with a real Gemini answer.
+
+## Contents
+
+- [Overview](#overview) · [Features](#features-and-status) · [Architecture](#architecture) · [Tech stack](#tech-stack) · [Repository structure](#repository-structure)
+- [Quick start (Windows)](#quick-start-windows) · [Configuration](#environment-variables) · [Gemini quota and fallback](#gemini-quota-and-fallback)
+- [Sign-in and chat history](#sign-in-and-chat-history) · [Documents (RAG)](#documents-rag) · [MetaGPT worker](#metagpt-worker-local-only)
+- [Deploy on Render](#deploy-on-render-free) · [CI](#continuous-integration) · [Security](#security) · [Testing](#testing) · [Troubleshooting](#troubleshooting)
+- [Limitations and future work](#limitations-and-future-work) · [Contributing](#contributing) · [License](#license) · [Links](#links)
+
+## Overview
+
+**Problem.** General chatbots can't answer questions about your own documents. Hosting an AI app publicly also exposes a limited API quota to anyone on the internet.
+
+**Objectives.**
+1. A public chat assistant backed by Google Gemini, with streaming answers.
+2. Grounded answers from user-uploaded documents, with citations, kept private per user or per chat.
+3. Optional sign-in with saved conversation history.
+4. A MetaGPT multi-agent workflow that turns an idea into requirements, a design and code.
+5. Running at ₹0/month, while staying usable when free quotas run out and protecting the quota from abuse.
+
+## Features and status
+
+| Feature | Status |
+|---|---|
+| Streaming chat with Gemini (Claude, OpenAI and Ollama also supported by the provider layer) | Live. Gemini verified; other providers implemented, not live-tested |
+| Automatic fallback across Gemini models on quota or overload | Live |
+| Document upload (PDF, TXT, MD, CSV, JSON) and cited answers | Live, verified with a PDF |
+| Per-chat private documents for anonymous visitors (auto-deleted) | Live |
+| Abuse protection: per-IP and global rate limits, size limits, model allow-list | In code (see [Security](#security)) |
+| Password sign-in, saved chat history in PostgreSQL | Implemented and tested locally; off on the public site by choice |
+| MetaGPT software-team jobs (`/build`) | Local only. Needs more memory than Render's free plan; a full run hasn't completed yet |
 
 ## Architecture
 
 ```
-Browser ──websocket──▶ Chainlit web app (nexora_app.py)
-                         │  nexora/providers.py   Gemini · Claude · OpenAI · Ollama
-                         │  nexora/rag/*          extract → chunk → embed → pgvector
-                         │  nexora/history.py     chat history (Chainlit data layer)
-                         │  nexora/auth.py        password sign-in (PBKDF2 hashes)
-                         │  nexora/limits.py      per-user rate limiting
-                         ├──────────────▶ Postgres + pgvector (Neon, Supabase, …)
-                         └──HTTPS + token─▶ MetaGPT worker (worker/app.py, FastAPI)
-                                              one job at a time, each in its own
-                                              process with a hard timeout
+Browser ──websocket──▶ Chainlit app (nexora_app.py) ── one free Render web service
+                         ├─ nexora/providers.py   Gemini · Claude · OpenAI · Ollama, retries, model fallback
+                         ├─ nexora/rag/*          extract → chunk → embed → pgvector → cited answer
+                         ├─ nexora/history.py     chat history (Chainlit data layer on PostgreSQL)
+                         ├─ nexora/auth.py        password sign-in (PBKDF2), login throttling
+                         └─ nexora/limits.py      rate limiting
+                              │
+                              ├──▶ Neon PostgreSQL + pgvector (documents, chunks, embeddings, history)
+                              └──HTTPS + token──▶ MetaGPT worker (worker/app.py, FastAPI), optional and local
 ```
 
-- Every key is read from server-side environment variables. Nothing secret reaches the browser.
-- Retrieved document text is wrapped in `<document>` tags, and the system prompt tells the model to treat it as data, never instructions. Tags inside documents are stripped so a file can't break out of its wrapper.
-- The worker only uses MetaGPT roles that write documents and code. `QaEngineer`, `Engineer2` and `DataAnalyst` are excluded because they execute generated code or shell commands. Each job needs the user's explicit approval in the chat.
+**Request flow for a document question:** the file is uploaded, then its text is extracted and cleaned, split into about 1,200-character chunks, embedded with `gemini-embedding-001` (768 dimensions), and stored in pgvector under the owner's ID. Each question is embedded, the top matches for the same owner are retrieved, and Gemini answers using them as untrusted reference text, citing `[1]`, `[2]`, and so on.
 
-## Requirements
+## Tech stack
 
-- Python 3.11 (MetaGPT supports `>=3.9,<3.12`)
-- At least one LLM API key (or a running Ollama server)
-- Optional: Postgres 15+ with the `vector` extension for documents
-- Optional: a second Python 3.11 environment for the MetaGPT worker
+| Layer | Technology |
+|---|---|
+| UI and server | [Chainlit](https://chainlit.io) 2.12 (Python 3.11) |
+| LLM | Google Gemini via `google-genai`; optional Anthropic Claude, OpenAI, Ollama |
+| Embeddings | `gemini-embedding-001` (or OpenAI `text-embedding-3-small`) |
+| Database | PostgreSQL with `pgvector` (Neon), via `asyncpg` |
+| Agents | [MetaGPT](https://github.com/FoundationAgents/MetaGPT) 1.0 in a FastAPI worker |
+| Quality | pytest, ruff, GitHub Actions |
+| Hosting | Render (free web service) |
 
-## Run locally
+## Repository structure
+
+| Path | Purpose |
+|---|---|
+| [`nexora_app.py`](nexora_app.py) | Chainlit entry point: chat, uploads, commands, limits |
+| [`nexora/providers.py`](nexora/providers.py) | Provider layer, error classification, retries, model fallback |
+| [`nexora/config.py`](nexora/config.py) | Environment-variable settings and validation |
+| [`nexora/rag/`](nexora/rag) | Extraction, chunking, embeddings, pgvector store, retrieval |
+| [`nexora/history.py`](nexora/history.py) | Chat history data layer (creates its tables, survives DB outages) |
+| [`nexora/auth.py`](nexora/auth.py) | Password hashing, account parsing, login throttling |
+| [`worker/`](worker) | MetaGPT job worker (FastAPI, job queue, sandboxed runner) |
+| [`tests/`](tests) | Unit tests with mocked providers, plus optional PostgreSQL integration tests |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: lint and tests on every push and pull request |
+| [`render.yaml`](render.yaml) | Render service definition (build and start commands) |
+| [`.env.example`](.env.example) | All settings with safe placeholders |
+| [`docs/screenshots/`](docs/screenshots) | README screenshots |
+
+## Quick start (Windows)
+
+Prerequisites: Python 3.11, Git, and a [Gemini API key](https://aistudio.google.com/apikey). PostgreSQL with pgvector is optional (for documents and history).
 
 ```bash
-python -m venv .venv
-.venv/Scripts/activate            # macOS/Linux: source .venv/bin/activate
+git clone https://github.com/rashmitha-j/Nexora-AI.git
+```
+
+```bash
+cd Nexora-AI
+```
+
+```bash
+py -3.11 -m venv .venv
+```
+
+```bash
+.\.venv\Scripts\activate
+```
+
+```bash
 pip install -r requirements-dev.txt
-cp .env.example .env              # then fill in at least GEMINI_API_KEY
+```
+
+```bash
+copy .env.example .env
+```
+
+Open `.env`, set `GEMINI_API_KEY`, then start the app:
+
+```bash
 chainlit run nexora_app.py
 ```
 
-Open http://localhost:8000.
-
-### Turn on sign-in (needed for documents and `/build`)
-
-```bash
-python -m nexora.auth             # prompts for a username and password, prints "user:hash"
-chainlit create-secret            # prints CHAINLIT_AUTH_SECRET=...
-```
-
-Put the printed values in `NEXORA_USERS` (comma-separate several users) and `CHAINLIT_AUTH_SECRET`.
-
-Turning sign-in on makes the whole site login-only (Chainlit can't mix public and signed-in visitors). Sign-out is in the user menu (top right).
-
-Safety built in:
-- Five wrong passwords for a username block further attempts for 15 minutes.
-- A malformed `NEXORA_USERS` entry is skipped and logged (the rest still work) instead of crashing the site; with no valid entries nobody can sign in.
-- Surrounding quotes or a pasted `NAME=` prefix in either variable are tolerated.
-- If `CHAINLIT_AUTH_SECRET` is missing, a temporary one is used and everyone is signed out on each restart, so set it.
-- Only one message per chat is processed at a time, so double-sending can't start parallel model calls.
-
-### Turn on documents and chat history
-
-Create a Postgres database with pgvector (Neon and Supabase both support it), set `DATABASE_URL`, and restart. Paste Neon's connection string as it is: options that only `psql` understands, such as `channel_binding`, are removed automatically. All tables are created on first use with `CREATE TABLE IF NOT EXISTS`; nothing is ever dropped. `EMBEDDING_DIM` is fixed when the tables are created, so changing it later needs a fresh database.
-
-**Without sign-in (public site):** anyone can attach documents, but each chat gets its own private document space: up to 5 files of about 300 KB of text each, never visible to other visitors. They're deleted when the visitor clicks **New chat**, and anything older than 24 hours is purged automatically. A closed tab or a dropped connection doesn't delete them straight away, because Chainlit lets the browser reconnect to the same chat. Chat history isn't saved for anonymous visitors.
-
-**With sign-in (`NEXORA_USERS`):** each user keeps their documents across chats, and their conversations are saved and listed in the sidebar.
-
-To save the free embedding quota, a question is only matched against documents when that chat actually has some.
-
-If the database is unreachable, chat keeps working: history pauses for 30 seconds at a time and document commands say storage is unavailable.
-
-> **Why this matters on Chainlit:** Chainlit turns on its own database layer whenever `DATABASE_URL` is set, and that layer needs `asyncpg` plus tables Chainlit never creates. Without `nexora/history.py` the page goes blank (`/project/settings` returns HTTP 500).
-
-### Run the MetaGPT worker
-
-Use a separate virtual environment, because MetaGPT pins many dependencies:
-
-```bash
-python -m venv .venv-worker
-PYTHON=.venv-worker/Scripts/python sh worker/install.sh      # macOS/Linux: .venv-worker/bin/python
-METAGPT_WORKER_TOKEN=<random 32+ chars> METAGPT_API_KEY=<gemini key> \
-  .venv-worker/Scripts/python -m uvicorn worker.app:app --port 8001
-```
-
-Then set `METAGPT_WORKER_URL=http://127.0.0.1:8001` and the same `METAGPT_WORKER_TOKEN` for the web app, and sign in (jobs belong to a user).
-
-Notes on running upstream MetaGPT:
-- `worker/requirements.txt` is upstream MetaGPT's dependency list at a pinned commit, with two changes. `lancedb==0.4.0` is removed because it's no longer on PyPI. `pyarrow` is added because `qianfan` otherwise injects a fake `pyarrow` that breaks pandas.
-- With `METAGPT_API_TYPE=gemini` (the default) the worker talks to Gemini through Google's OpenAI-compatible endpoint. MetaGPT's native Gemini client drops all system prompts, so its first step fails.
-- Each job runs in its own process, starting inside its own workspace folder, with a per-job home directory and a fixed git identity, and is killed at `METAGPT_JOB_TIMEOUT_SECONDS`. The project path is never taken from the user's idea, so generated files stay in the job's workspace.
-- MetaGPT 1.0's "quick think" shortcut is disabled for the hired roles; otherwise small ideas get a chat answer instead of running the pipeline.
-- A full run makes dozens of LLM calls. On Gemini's free tier that can use a large share of a model's daily quota, so point the worker at a different model (or key) than the public chat if you can.
-
-## Commands in the chat
-
-| Command | What it does |
-|---|---|
-| `/help` | List available commands |
-| `/docs` | List your documents |
-| `/forget <n>` | Delete document *n* from `/docs` (asks first) |
-| `/reindex` | Re-embed your documents after changing `EMBEDDING_MODEL` |
-| `/build <idea>` | Run a MetaGPT job (asks first) |
-| `/usage` | Token usage for this chat |
+Open http://localhost:8000. On macOS or Linux, use `python3.11 -m venv .venv`, `source .venv/bin/activate` and `cp .env.example .env`.
 
 ## Environment variables
 
-See [.env.example](.env.example) for the full list with defaults.
+[`.env.example`](.env.example) lists every setting with defaults. The important ones:
 
-| Variable | Used by | Purpose |
-|---|---|---|
-| `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL` | web | Chat providers (at least one) |
-| `NEXORA_PROVIDER`, `*_MODEL`, `*_FALLBACK_MODELS` | web | Default provider, models, and models to fall back to on quota/overload errors |
-| `LLM_TIMEOUT_SECONDS`, `MAX_OUTPUT_TOKENS`, `RATE_LIMIT_PER_MINUTE`, `MAX_MESSAGE_CHARS`, `HISTORY_TURNS` | web | Limits |
-| `NEXORA_USERS`, `CHAINLIT_AUTH_SECRET` | web | Sign-in |
-| `DATABASE_URL`, `EMBEDDING_*`, `RAG_TOP_K`, `RAG_MIN_SCORE`, `MAX_UPLOAD_MB` | web | Documents |
-| `METAGPT_WORKER_URL`, `METAGPT_WORKER_TOKEN` | web + worker | Worker connection |
-| `METAGPT_API_TYPE`, `METAGPT_MODEL`, `METAGPT_API_KEY`, `METAGPT_JOB_TIMEOUT_SECONDS`, `METAGPT_MAX_TOKENS`, `WORKER_JOBS_DIR` | worker | MetaGPT runs |
+| Variable | Purpose |
+|---|---|
+| `GEMINI_API_KEY` | Gemini key (or configure `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL`) |
+| `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS` | Main model and the models tried after it |
+| `DATABASE_URL` | PostgreSQL with pgvector; turns on documents (and history when sign-in is on) |
+| `NEXORA_USERS`, `CHAINLIT_AUTH_SECRET` | Sign-in accounts and session secret |
+| `RATE_LIMIT_PER_MINUTE`, `GLOBAL_RATE_LIMIT_PER_MINUTE` | Per-visitor and site-wide message limits |
+| `MAX_MESSAGE_CHARS`, `MAX_UPLOAD_MB`, `MAX_OUTPUT_TOKENS`, `LLM_TIMEOUT_SECONDS` | Request size, upload size, answer length and time limits |
+| `METAGPT_WORKER_URL`, `METAGPT_WORKER_TOKEN` | Connection to the optional MetaGPT worker |
 
-## Tests and checks
+Secrets live only in `.env` (git-ignored) or the Render dashboard, never in the repository.
+
+## Gemini quota and fallback
+
+Gemini's free tier limits requests per minute and per day, **separately for each model**. Nexora handles this as follows:
+- Each answer tries `GEMINI_MODEL` first (default `gemini-3.5-flash`), then `GEMINI_FALLBACK_MODELS` in order (default `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`).
+- **Daily quota used up (429 with a per-day quota ID):** that model is skipped until Google's reported reset time, with no wasted calls.
+- **Overloaded (503):** go straight to the next model.
+- **Temporary errors (other 429s, 500s, timeouts):** up to 3 attempts with backoff, and only before any text has streamed, so users never see duplicated text.
+- **Invalid key or bad request:** no fallback; a clear message is shown.
+- The Gemini SDK's own retries are turned off, so retries happen in one place and requests are bounded.
+- If every model fails, the user sees a plain message (for example "rate limit or quota reached"). Technical details go only to the server log.
+
+## Sign-in and chat history
+
+Off by default, so the site is public. To turn it on:
 
 ```bash
-python -m pytest
-python -m ruff check .
-python -m ruff format --check .
+python -m nexora.auth
 ```
 
-The tests use fakes for LLM providers, the vector store and MetaGPT, so they need no keys or network. To also run the Postgres integration tests, point them at a **throwaway** database with pgvector:
+That prints a `username:hash` line for `NEXORA_USERS` (use commas between several users).
 
 ```bash
-NEXORA_TEST_DATABASE_URL=postgresql://... python -m pytest tests/test_postgres_integration.py
+chainlit create-secret
 ```
+
+That prints the value for `CHAINLIT_AUTH_SECRET`.
+
+With both set (and `DATABASE_URL`), the site becomes login-only. Each user's conversations are saved in PostgreSQL and listed in the sidebar, and reopening one restores its context. Sign-out is in the user menu. Users can only open their own threads and documents.
+
+Safeguards:
+- Five failed logins lock that username for 15 minutes.
+- A malformed account entry is skipped and logged rather than crashing the site.
+- If `CHAINLIT_AUTH_SECRET` is missing, a temporary one is used, so sign-ins reset on each restart.
+
+## Documents (RAG)
+
+Attach a PDF, TXT, MD, CSV or JSON file to a message, then ask about it. Answers cite their sources.
+
+Commands:
+- `/docs` lists your documents.
+- `/forget <n>` deletes one (after a confirmation).
+- `/reindex` re-embeds your documents after changing the embedding model.
+- `/usage` shows token usage for the chat.
+
+How documents are handled:
+- Tables are created automatically with `CREATE TABLE IF NOT EXISTS`; nothing is ever dropped.
+- Re-uploading the same file re-indexes it instead of duplicating it.
+- Extracted text has control characters (such as NUL) removed. Damaged, encrypted or scanned (image-only) PDFs get a clear message.
+- **Anonymous visitors:** documents are private to the current chat (up to 5 files, about 300 KB of text each). They're deleted when the visitor starts a new chat, or after 24 hours.
+- **Signed-in users:** documents are kept across chats.
+- Questions are only embedded when the chat actually has documents, which saves quota.
+- Original files aren't stored, only their extracted text and embeddings, so Render's temporary disk isn't relied on.
+
+## MetaGPT worker (local only)
+
+`/build <idea>` asks for confirmation, then sends the idea to a separate worker. There a MetaGPT team (product manager, architect, project manager and engineer) writes requirements, a design and code, and the result comes back as a zip.
+- **Bounded:** one job at a time, a hard timeout per job, and a bounded queue.
+- **Sandboxed:** each job runs in its own process, with its own folder and home directory.
+- **No code execution:** roles that run generated code are excluded.
+
+Setup (needs a second Python 3.11 environment):
+
+```bash
+py -3.11 -m venv .venv-worker
+```
+
+```bash
+set PYTHON=.venv-worker\Scripts\python && sh worker/install.sh
+```
+
+Start it with `METAGPT_WORKER_TOKEN` and `METAGPT_API_KEY` set:
+
+```bash
+.venv-worker\Scripts\python -m uvicorn worker.app:app --port 8001
+```
+
+Then set `METAGPT_WORKER_URL=http://127.0.0.1:8001` and the same token for the app, and sign in.
+
+**Current status:**
+- The pipeline starts and produced a full requirements document in testing.
+- A complete end-to-end run hasn't finished yet, because Gemini's free daily quota and overload ran out first.
+- The worker isn't deployed, because MetaGPT needs more than Render's free 512 MB of memory.
+
+Upstream issues fixed in this repo (no MetaGPT changes; all in configuration and wrapping):
+- Gemini system prompts were dropped.
+- The quick-think shortcut skipped the pipeline.
+- The project path came from user text.
+- `lancedb` and `pyarrow` dependency problems.
 
 ## Deploy on Render (free)
 
-The live service is a Render **free web service** with:
+Settings on Render ([`render.yaml`](render.yaml) describes the same):
 
-- Build command: `pip install -r requirements.txt`
-- Start command: `chainlit run nexora_app.py --host 0.0.0.0 --port $PORT --headless`
-- Health check path: `/health`
-- Environment: `PYTHON_VERSION=3.11.9`, `GEMINI_API_KEY`, and optionally `GEMINI_MODEL`, `DATABASE_URL`, `NEXORA_USERS`, `CHAINLIT_AUTH_SECRET`
+| Setting | Value |
+|---|---|
+| Build command | `pip install -r requirements.txt` |
+| Start command | `chainlit run nexora_app.py --host 0.0.0.0 --port $PORT --headless` |
+| Health check path | `/health` |
+| Environment | `PYTHON_VERSION=3.11.9`, `GEMINI_API_KEY`, `DATABASE_URL` (optional: `NEXORA_USERS`, `CHAINLIT_AUTH_SECRET`) |
 
-`render.yaml` describes the same service if you ever recreate it as a Blueprint. Set secrets in the Render dashboard (**Environment** tab), never in the repository.
+Automatic deploys are off on the current service. After pushing, open the service in the [Render dashboard](https://dashboard.render.com/) and use **Manual Deploy → Deploy latest commit**.
 
-## Known limitations (free tier)
+## Continuous integration
 
-- **Cold starts.** Render's free web services sleep after 15 minutes without traffic; the first visit afterwards takes about a minute.
-- **Gemini quotas.** The free Gemini tier limits requests per minute and per day, **per model**. When the main model (`gemini-3.5-flash`) hits its quota or is overloaded, Nexora automatically retries with `GEMINI_FALLBACK_MODELS` (default `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, then `gemini-3.1-flash-lite`). Only when all of them are exhausted do users see a "rate limit or quota reached" message. `gemini-2.5-flash` no longer works for new API keys.
-- **Neon free plan.** Storage is limited (0.5 GB at the time of writing) and the database suspends when idle, so the first query after a pause is slower. Pool sizes are kept small (history 5, documents 3 connections).
-- **Single instance.** Rate limits and the job queue live in memory, so run one instance. With more instances, move them to Redis.
-- **MetaGPT** needs more than the free plan's 512 MB of RAM, so `/build` is only available when you run the worker yourself.
-- **Uploaded files aren't kept.** Only their extracted text and embeddings are stored; the original file isn't (no file storage is configured).
-- **Scanned PDFs** have no text layer and are rejected. Run OCR first.
-- **CORS.** `.chainlit/config.toml` allows all origins (Chainlit's default). Set `allow_origins` to your deployed URL for production.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request to `main`. It installs the dependencies on Python 3.11.9, runs `ruff check`, `ruff format --check` and `pytest`. CI needs no API keys or database: providers are mocked, and the PostgreSQL integration tests skip themselves unless `NEXORA_TEST_DATABASE_URL` is set. [See the runs](https://github.com/rashmitha-j/Nexora-AI/actions).
+
+## Security
+
+- **Server-side limits:**
+  - Messages per minute: per signed-in user, or **per IP address** for anonymous visitors, so opening new chats doesn't reset the allowance.
+  - A site-wide per-minute cap.
+  - Maximum message length, upload size, document count and size, and answer length.
+- **No client-chosen models:** the model dropdown only offers server-approved models, and the server rejects anything else sent over the socket. Cost and quota can't be bypassed by picking an arbitrary model.
+- **One request at a time per chat,** so double-sending can't trigger parallel model calls.
+- **Timeouts everywhere:**
+  - Model calls, embeddings and database operations all have timeouts.
+  - Retries are bounded and never unlimited.
+  - Users always get a reply or a clear error.
+- **Prompt-injection hardening:** retrieved document text is wrapped and marked as untrusted data, and tags inside documents are stripped.
+- **Data isolation:** every document query is filtered by owner; chat threads are checked against their author.
+- **Secrets stay server-side:**
+  - API keys and database URLs live only in environment variables.
+  - Logs and user-facing errors never include them.
+  - The repository contains only placeholders.
+- **Parameterized SQL** throughout (`asyncpg`); no debug or admin endpoints are exposed.
+- **Known limitation:** rate limits are kept in memory, so they apply per instance (fine for one Render instance; use Redis if you scale out).
+
+## Testing
+
+```bash
+python -m pytest
+```
+
+```bash
+python -m ruff check .
+```
+
+```bash
+python -m ruff format --check .
+```
+
+Tests cover configuration validation, password hashing and login throttling, rate limiting, streaming, retries and error classification, model fallback and the model allow-list, chunking and text cleaning, owner isolation in retrieval, the MetaGPT job queue and API, and chat-history degradation when the database is down.
+
+To also run the PostgreSQL integration tests, point them at a **throwaway** database with pgvector:
+
+```bash
+set NEXORA_TEST_DATABASE_URL=postgresql://user:pass@host/db && python -m pytest tests/test_postgres_integration.py
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Blank page, `/project/settings` returns 500 | Fixed: Chainlit's own data layer needed `asyncpg` and tables. The app now registers its own data layer |
+| "rate limit or quota reached" | Every Gemini model is out of its daily quota; it resets daily. Check [AI Studio usage](https://aistudio.google.com/usage) |
+| "is overloaded right now" | Google-side load; try again shortly. Fallback models are already tried |
+| "Document storage is unavailable" | The database didn't respond (Neon may be waking up). Chat still works; retry |
+| "couldn't read this PDF" / "no extractable text" | The file is damaged, encrypted or scanned. Use a text-based PDF or run OCR first |
+| First visit is slow | Render free service waking up (about 1 minute) |
+
+## Limitations and future work
+
+- Free-tier limits: Render sleeps when idle, Gemini's daily quotas, and Neon's small storage.
+- MetaGPT runs locally only and hasn't completed a full run yet.
+- Rate limits are per instance (in memory).
+- Possible next steps:
+  - A Redis-backed rate limiter.
+  - OCR for scanned PDFs.
+  - Self-service sign-up.
+  - A hosted worker once a suitable free option exists.
+
+## Contributing
+
+Issues and pull requests are welcome: [open an issue](https://github.com/rashmitha-j/Nexora-AI/issues). Please run `ruff check .`, `ruff format .` and `pytest` before submitting; CI runs the same checks.
+
+## License
+
+[MIT](LICENSE) © 2026 Rashmitha J. MetaGPT is used as a dependency under its own MIT license.
+
+## Links
+
+| | |
+|---|---|
+| Live app | https://nexora-ai-jcdz.onrender.com |
+| Repository | https://github.com/rashmitha-j/Nexora-AI |
+| Source code | https://github.com/rashmitha-j/Nexora-AI/tree/main |
+| Issues | https://github.com/rashmitha-j/Nexora-AI/issues |
+| Commit history | https://github.com/rashmitha-j/Nexora-AI/commits/main |
+| GitHub Actions | https://github.com/rashmitha-j/Nexora-AI/actions |
+| Render dashboard | https://dashboard.render.com/ |
+| Google AI Studio | https://aistudio.google.com/ |
+| Neon console | https://console.neon.tech/ |

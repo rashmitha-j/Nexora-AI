@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import chainlit as cl
-from chainlit.input_widget import Select, Switch, TextInput
+from chainlit.input_widget import Select, Switch
 from dotenv import load_dotenv
 
 from nexora.auth import LoginThrottle, authenticate, clean_env_value, parse_users_lenient
@@ -24,6 +24,7 @@ from nexora.providers import (
     ChatMessage,
     ProviderError,
     Usage,
+    allowed_models,
     build_provider,
     candidate_models,
     classify,
@@ -47,6 +48,9 @@ logger = logging.getLogger("nexora")
 
 settings = load_settings()
 limiter = RateLimiter(settings.rate_limit_per_minute)
+# Caps total traffic from everyone together, protecting the shared free-tier model quota.
+global_limiter = RateLimiter(settings.global_rate_limit_per_minute)
+AUTO_MODEL = "automatic"
 jobs = JobClient(settings.worker_url, settings.worker_token) if settings.jobs_enabled else None
 
 rag: RagService | None = None
@@ -158,8 +162,21 @@ def is_anonymous() -> bool:
     return current_owner() is None
 
 
+def client_ip() -> str | None:
+    """The visitor's IP as reported by Render's proxy (first X-Forwarded-For entry)."""
+    environ = getattr(cl.context.session, "environ", None) or {}
+    forwarded = environ.get("HTTP_X_FORWARDED_FOR", "")
+    ip = forwarded.split(",")[0].strip() or environ.get("REMOTE_ADDR", "")
+    return ip or None
+
+
 def rate_limit_key() -> str:
-    return doc_owner()
+    """Signed-in users are limited per account. Anonymous visitors are limited per IP, so
+    opening new chats (new sessions) doesn't reset their allowance."""
+    if not is_anonymous():
+        return doc_owner()
+    ip = client_ip()
+    return f"ip:{ip}" if ip else doc_owner()
 
 
 async def ensure_rag_schema() -> None:
@@ -246,11 +263,12 @@ async def init_session(history: list[ChatMessage]) -> bool:
             values=settings.providers,
             initial_value=settings.default_provider,
         ),
-        TextInput(
+        # A fixed list, never free text: the server only accepts models it allows.
+        Select(
             id="model",
-            label="Model (blank = server default for the provider)",
-            initial="",
-            placeholder=settings.models[settings.default_provider],
+            label="Model",
+            values=[AUTO_MODEL] + allowed_models(settings, settings.default_provider),
+            initial_value=AUTO_MODEL,
         ),
     ]
     if docs_available:
@@ -316,12 +334,17 @@ async def on_settings_update(new_settings: dict):
     if provider not in settings.providers:
         await say(f"Provider `{provider}` isn't configured on this server.")
         return
+    # Validate on the server: settings arrive over the socket and can be forged by a client.
+    model = str(new_settings.get("model") or AUTO_MODEL).strip()
+    if model != AUTO_MODEL and model not in allowed_models(settings, provider):
+        await say("That model isn't available on this server; keeping the automatic choice.")
+        model = AUTO_MODEL
     cl.user_session.set("provider", provider)
-    cl.user_session.set("model", (new_settings.get("model") or "").strip())
+    cl.user_session.set("model", "" if model == AUTO_MODEL else model)
     if "use_docs" in new_settings:
         cl.user_session.set("use_docs", bool(new_settings["use_docs"]))
-    model = cl.user_session.get("model") or settings.models[provider]
-    await say(f"Now using **{provider}** (`{model}`).")
+    shown = cl.user_session.get("model") or f"automatic, starting with {settings.models[provider]}"
+    await say(f"Now using **{provider}** ({shown}).")
 
 
 @cl.on_message
@@ -351,6 +374,9 @@ async def handle_message(message: cl.Message) -> None:
     wait = limiter.check(rate_limit_key())
     if wait:
         await say(f"You're sending messages too quickly. Try again in {int(wait) + 1} seconds.")
+        return
+    if global_limiter.check("all"):
+        await say("Nexora is busy right now. Please try again in a minute.")
         return
 
     files = [e for e in (message.elements or []) if getattr(e, "path", None)]

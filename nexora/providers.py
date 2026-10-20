@@ -277,13 +277,21 @@ async def stream_reply(
             await asyncio.sleep(2 ** (attempt - 1))
 
 
-def candidate_models(settings: Settings, name: str, override: str | None) -> list[str]:
-    """The model to try first, then the provider's fallbacks. A model the user picked
-    explicitly is used on its own."""
-    if override and override.strip():
-        return [override.strip()]
+def allowed_models(settings: Settings, name: str) -> list[str]:
+    """The only models a visitor may use for a provider: the server's default and its fallbacks."""
     primary = settings.models[name]
     return [primary] + [m for m in settings.fallback_models.get(name, []) if m != primary]
+
+
+def candidate_models(settings: Settings, name: str, override: str | None) -> list[str]:
+    """The models to try, in order. A visitor's choice is honoured only if the server allows
+    that model (anything else is ignored, so a client can't pick an arbitrary or costlier
+    model), and the remaining allowed models stay behind it as fallbacks."""
+    allowed = allowed_models(settings, name)
+    choice = (override or "").strip()
+    if choice in allowed:
+        return [choice] + [m for m in allowed if m != choice]
+    return allowed
 
 
 # Models whose daily quota is used up, mapped to when they can be tried again. Skipping
